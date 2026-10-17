@@ -1,6 +1,7 @@
 import os
 import re
 import json
+from datetime import datetime, timezone, timedelta
 from pydantic import BaseModel, Field
 from typing import Optional
 from google import genai
@@ -25,15 +26,16 @@ class UpdateOutput(BaseModel):
 def process_comment():
     issue = repo.get_issue(number=ISSUE_NUMBER)
     
-    # 從 Issue 內容找出對應的筆記檔案路徑與 PDF 名稱
-    match = re.search(r"`(notes/[^`]+\.md)`", issue.body)
-    if not match:
+    # 從 Issue 內容找出對應的筆記檔案路徑
+    match_note = re.search(r"`(notes/[^`]+\.md)`", issue.body)
+    match_pdf = re.search(r"在閱讀 `([^`]+\.pdf)`", issue.body)
+    if not match_note:
         print("此 Issue 非筆記補全任務，略過。")
         return
     
-    note_path = match.group(1)
-    base_name = os.path.splitext(os.path.basename(note_path))[0]
-    pdf_path = f"incoming/{base_name}.pdf"
+    note_path = match_note.group(1)
+    pdf_name = match_pdf.group(1) if match_pdf else ""
+    pdf_path = f"incoming/{pdf_name}" if pdf_name else ""
 
     if not os.path.exists(note_path):
         print(f"找不到筆記檔案: {note_path}")
@@ -41,6 +43,9 @@ def process_comment():
 
     with open(note_path, "r", encoding="utf-8") as f:
         current_note = f.read()
+
+    # 保留原筆記的第一行時間標題
+    first_line = current_note.splitlines()[0] if current_note else f"# 課堂筆記：{note_path}"
 
     # 收集 Issue 中的所有對話紀錄
     conversation = f"初始提問：\n{issue.body}\n\n"
@@ -53,8 +58,7 @@ def process_comment():
         "請根據使用者的最新回覆，修正並補全筆記內容與摘要。若原板書還有其他未釐清的疑問，請在 next_question 提出下一個問題（一次一題）；若已全部清楚，next_question 請填 null。"
     ]
 
-    # 如果原 PDF 還在，一併附上讓 AI 對照
-    if os.path.exists(pdf_path):
+    if pdf_path and os.path.exists(pdf_path):
         with open(pdf_path, "rb") as f:
             pdf_bytes = f.read()
         contents.insert(0, types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"))
@@ -78,14 +82,18 @@ def process_comment():
         notes = data.get("updated_notes", "")
         next_q = data.get("next_question")
 
+    tz_tw = timezone(timedelta(hours=8))
+    update_time_str = datetime.now(tz_tw).strftime("%Y-%m-%d %H:%M")
+
     prompt_block = (
         "```markdown\n"
-        f"你現在是該領域的教學專家。請根據上述「{base_name}」的筆記內容，出 3 題觀念驗證題（包含 1 題陷阱選擇題與 2 題推導/問答題），並附上詳細詳解與評分標準。\n"
+        f"你現在是該領域的教學專家。請根據上述筆記內容，出 3 題觀念驗證題（包含 1 題陷阱選擇題與 2 題推導/問答題），並附上詳細詳解與評分標準。\n"
         "```"
     )
 
     final_content = (
-        f"# 課堂筆記：{base_name}\n\n"
+        f"{first_line}\n"
+        f"> **原始檔案**：`{pdf_path}` ｜ **最後更新**：{update_time_str}\n\n"
         f"## 📌 3 分鐘核心摘要\n{summary}\n\n"
         f"---\n\n"
         f"## 📖 結構化重點筆記\n{notes}\n\n"
@@ -97,16 +105,15 @@ def process_comment():
         f.write(final_content)
     print(f"✅ 已根據回覆更新筆記：{note_path}")
 
-    # 判斷是否還有下一題，或是結案
     if next_q and str(next_q).strip().lower() != "null":
         issue.create_comment(
-            f"✅ 已將您的回覆整合至 `{note_path}`！\n\n"
+            f"✅ 已將您的回覆整合至 `{note_path}`（更新時間：{update_time_str}）！\n\n"
             f"### 追問下一題：\n> **{next_q}**\n\n"
             f"請直接於下方繼續留言回覆。"
         )
     else:
         issue.create_comment(
-            f"🎉 感謝確認！所有疑問皆已釐清，最終完整版筆記已更新至 `{note_path}`。\n\n"
+            f"🎉 感謝確認！所有疑問皆已釐清，最終完整版筆記已更新至 `{note_path}`（更新時間：{update_time_str}）。\n\n"
             f"---\n### 💡 專屬後續複習提示詞\n{prompt_block}"
         )
         issue.edit(state="closed")
