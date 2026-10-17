@@ -23,42 +23,35 @@ class NoteOutput(BaseModel):
     topic: str = Field(description="用 5~12 個字精簡概括這份板書的核心主題（做為標題用）")
     summary: str = Field(description="3~5 個重點的核心精華摘要 (Markdown 格式)")
     notes: str = Field(description="完整的結構化筆記，包含章節、公式推導、關鍵觀念、範例 (Markdown 格式)")
-    question: Optional[str] = Field(default=None, description="如果板書有缺漏、遮蔽、筆跡模糊或邏輯中斷，請提出『一個』最關鍵的具體問題向使用者確認。如果內容完整無缺漏，請填 null。")
+    question: Optional[str] = Field(default=None, description="如果板書有缺漏, 遮蔽, 筆跡模糊或邏輯中斷, 請提出『一個』最關鍵的具體問題向使用者確認。如果內容完整無缺漏, 請填 null。")
 
 SYSTEM_PROMPT = """
 你是一位專業的高效學習助理與知識工程師。你的任務是閱讀使用者上傳的課堂板書/筆記 PDF，將其整理為條理分明、概念嚴謹的 Markdown 筆記。
 
 【GitHub LaTeX 公式排版嚴格規範（極重要）】：
 1. 行內公式請使用單個錢字號 `$公式$`，獨立區塊公式請使用雙錢字號 `$$公式$$` 並前後空行。
-2. 絕對禁止將 `$公式$` 放在半形括號 `(...)` 內緊貼，若需括號請一律使用全形中文括號 `（$公式$）`。
-3. `$` 符號的內側開頭與結尾絕對不可有空格（正確：`$L \\to \\infty$`，錯誤：`$ L \\to \\infty $`）。
-4. 嚴禁在 Markdown 標題（`#`, `##`, `###`）或粗體（`**...**`）內部嵌套 `$公式$`。
+2. 絕對禁止將 `$公式$` 緊貼半形括號或中文字，外側請務必各留一個半形空白（例如：`（ $0 \sim t_a$ ）`）。
+3. 區塊公式 `$$` 內部絕對不能有空行，且 `$$` 必須獨佔一行。
 """
 
 def fix_github_latex(text: str) -> str:
     if not text:
         return ""
-    # 1. 修復被 JSON 誤轉義的控制字元（如 \to, \beta, \frac, \right）
     text = text.replace("\t", "\\t").replace("\b", "\\b").replace("\f", "\\f").replace("\r", "");
 
-    # 2. 處理區塊公式 $$...$$：移除內部多餘空行，並強制讓開頭與結尾的 $$ 獨立成行
     def format_block_math(match):
         content = match.group(1).strip()
-        # 移除公式塊內部的空行（GitHub 遇到空行會中斷數學渲染）
         lines = [line.strip() for line in content.splitlines() if line.strip()]
         clean_content = "\n".join(lines)
         return f"\n\n$$\n{clean_content}\n$$\n\n"
 
     text = re.sub(r'\$\$([\s\S]+?)\$\$', format_block_math, text);
 
-    # 3. 處理行內公式 $...$：去除 $ 內側空白，並在 $ 外側前後強制加上半形空白（解決中文字與全形括號緊貼問題）
     def format_inline_math(match):
         inner = match.group(1).strip()
         return f" ${inner}$ "
 
     text = re.sub(r'(?<!\$)\$(?!\$)([^\$\n]+?)(?<!\$)\$(?!\$)', format_inline_math, text);
-
-    # 4. 清理多餘的連續空白與過多空行
     text = re.sub(r'[ ]{2,}', ' ', text);
     text = re.sub(r'\n{3,}', '\n\n', text);
     return text.strip()
@@ -90,6 +83,7 @@ def process_latest_pdf():
     pdf_name = os.path.basename(latest_pdf)
     base_name = os.path.splitext(pdf_name)[0]
 
+    # 1. 自動辨識科目名稱
     root_folder = "原始檔案" if latest_pdf.startswith("原始檔案") else "incoming"
     rel_dir = os.path.dirname(os.path.relpath(latest_pdf, root_folder))
     if rel_dir and rel_dir != ".":
@@ -99,18 +93,26 @@ def process_latest_pdf():
     else:
         subject = "一般科目"
 
-    tz_tw = timezone(timedelta(hours=8))
-    now_tw = datetime.now(tz_tw)
-    date_str = now_tw.strftime("%Y-%m-%d")
-    time_str = now_tw.strftime("%H:%M")
+    # 2. 智慧抓取日期：優先從檔名或完整路徑中用正則尋找 YYYY-MM-DD
+    date_match = re.search(r'20\d{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])', latest_pdf)
+    if date_match:
+        date_str = date_match.group(0)
+        target_date = datetime.strptime(date_str, "%Y-%m-%d")
+    else:
+        # 如果檔名沒寫日期，則使用台灣時區當天日期
+        tz_tw = timezone(timedelta(hours=8))
+        target_date = datetime.now(tz_tw)
+        date_str = target_date.strftime("%Y-%m-%d")
+
     weekdays = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
-    weekday_str = weekdays[now_tw.weekday()]
+    weekday_str = weekdays[target_date.weekday()]
+    time_str = "12:00"  # 預設時間
 
     output_dir = f"notes/{subject}"
     os.makedirs(output_dir, exist_ok=True)
     output_md_path = f"{output_dir}/{date_str}_{base_name}.md"
 
-    print(f"正在處理檔案: {latest_pdf} (科目: {subject})")
+    print(f"正在處理檔案: {latest_pdf} (科目: {subject}, 日期: {date_str})")
 
     with open(latest_pdf, "rb") as f:
         pdf_bytes = f.read()
@@ -129,7 +131,7 @@ def process_latest_pdf():
     response = call_gemini_with_retry(
         contents=[
             pdf_part,
-            f"這是一份「{subject}」科目的板書 PDF，請詳細閱讀並依照規範產出核心主題、摘要、完整結構化筆記與單題缺漏提問。請特別注意 LaTeX 公式不要緊貼半形括號。"
+            f"這是一份「{subject}」科目於 {date_str} 的板書 PDF，請詳細閱讀並依照規範產出核心主題、摘要、完整結構化筆記與單題缺漏提問。"
         ],
         config=config
     )
@@ -152,7 +154,7 @@ def process_latest_pdf():
     if question:
         question = fix_github_latex(question)
 
-    header_title = f"# 📅 {date_str} ({weekday_str}) {time_str}｜【{subject}】{topic}"
+    header_title = f"# 📅 {date_str} ({weekday_str})｜【{subject}】{topic}"
 
     prompt_block = (
         "```markdown\n"
@@ -162,7 +164,7 @@ def process_latest_pdf():
 
     final_content = (
         f"{header_title}\n"
-        f"> **科目**：`{subject}` ｜ **原始檔案**：`{latest_pdf}`\n\n"
+        f"> **科目**：`{subject}` ｜ **上課日期**：`{date_str}` ｜ **原始檔案**：`{latest_pdf}`\n\n"
         f"## 📌 3 分鐘核心摘要\n{summary}\n\n"
         f"---\n\n"
         f"## 📖 結構化重點筆記\n{notes}\n\n"
