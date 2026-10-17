@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import time
 from datetime import datetime, timezone, timedelta
 from pydantic import BaseModel, Field
 from typing import Optional
@@ -23,10 +24,39 @@ class UpdateOutput(BaseModel):
     updated_notes: str = Field(description="整合使用者補充回答後的完整結構化筆記 (Markdown 格式)")
     next_question: Optional[str] = Field(default=None, description="如果還有其他尚未釐清的模糊或缺漏處，請再提出『一個』問題。如果所有問題都已釐清，請填 null。")
 
+def fix_github_latex(text: str) -> str:
+    if not text:
+        return ""
+    text = text.replace("\t", "\\t").replace("\b", "\\b").replace("\f", "\\f")
+    def strip_inner_math(match):
+        return f"${match.group(1).strip()}$"
+    text = re.sub(r'(?<!\$)\$(?!\$)([^\$\n]+?)(?<!\$)\$(?!\$)', strip_inner_math, text)
+    text = re.sub(r'\((\$[^\$\n]+\$)\)', r'（\1）', text)
+    text = re.sub(r'\((\$[^\$\n]+\$)', r'( \1', text) text = re.sub(r'(\$[^\$\n]+\$)\)', r'\1 )', text)
+    text = re.sub(r'([^\n])\s*\$\$([\s\S]+?)\$\$', r'\1\n\n$$\2$$', text)
+    text = re.sub(r'\$\$([\s\S]+?)\$\$\s*([^\n])', r'$$\1$$\n\n\2', text)
+    return text
+
+def call_gemini_with_retry(contents, config, max_retries=5):
+    for attempt in range(1, max_retries + 1):
+        try:
+            return client.models.generate_content(
+                model="gemini-3.8-flash",
+                contents=contents,
+                config=config
+            )
+        except Exception as e:
+            err_msg = str(e)
+            if ("503" in err_msg or "429" in err_msg or "UNAVAILABLE" in err_msg) and attempt < max_retries:
+                wait_sec = attempt * 10
+                print(f"⚠️ Google 伺服器忙碌中 (第 {attempt}/{max_retries} 次嘗試)，等待 {wait_sec} 秒後重試...")
+                time.sleep(wait_sec)
+            else:
+                raise e
+
 def process_comment():
     issue = repo.get_issue(number=ISSUE_NUMBER)
     
-    # 從 Issue 內容找出對應的筆記檔案路徑
     match_note = re.search(r"`(notes/[^`]+\.md)`", issue.body)
     match_pdf = re.search(r"在閱讀 `([^`]+\.pdf)`", issue.body)
     if not match_note:
@@ -34,8 +64,6 @@ def process_comment():
         return
     
     note_path = match_note.group(1)
-    pdf_name = match_pdf.group(1) if match_pdf else ""
-    match_pdf = re.search(r"在閱讀 `([^`]+\.pdf)`", issue.body)
     pdf_path = match_pdf.group(1) if match_pdf else ""
 
     if not os.path.exists(note_path):
@@ -45,10 +73,8 @@ def process_comment():
     with open(note_path, "r", encoding="utf-8") as f:
         current_note = f.read()
 
-    # 保留原筆記的第一行時間標題
     first_line = current_note.splitlines()[0] if current_note else f"# 課堂筆記：{note_path}"
 
-    # 收集 Issue 中的所有對話紀錄
     conversation = f"初始提問：\n{issue.body}\n\n"
     for comment in issue.get_comments():
         conversation += f"[{comment.user.login} 回覆]：\n{comment.body}\n\n"
@@ -64,15 +90,16 @@ def process_comment():
             pdf_bytes = f.read()
         contents.insert(0, types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"))
 
-    response = client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction="你是一位專業的學習助理。請將使用者的回答無縫整合進原有的課堂筆記中，修正錯誤或補齊缺漏的推導。數學與電路公式請維持標準 LaTeX 格式。",
-            response_mime_type="application/json",
-            response_schema=UpdateOutput,
-        )
+    config = types.GenerateContentConfig(
+        system_instruction=(
+            "你是一位專業的學習助理。請將使用者的回答無縫整合進原有的課堂筆記中，修正錯誤或補齊缺漏的推導。"
+            "數學與電路公式請維持標準 LaTeX 格式，且切勿將 $公式$ 緊貼半形括號，請一律用全形括號（$公式$）。"
+        ),
+        response_mime_type="application/json",
+        response_schema=UpdateOutput,
     )
+
+    response = call_gemini_with_retry(contents=contents, config=config)
 
     if response.parsed:
         res = response.parsed
@@ -82,6 +109,11 @@ def process_comment():
         summary = data.get("updated_summary", "")
         notes = data.get("updated_notes", "")
         next_q = data.get("next_question")
+
+    summary = fix_github_latex(summary)
+    notes = fix_github_latex(notes)
+    if next_q:
+        next_q = fix_github_latex(next_q)
 
     tz_tw = timezone(timedelta(hours=8))
     update_time_str = datetime.now(tz_tw).strftime("%Y-%m-%d %H:%M")
