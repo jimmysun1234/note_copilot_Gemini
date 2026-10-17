@@ -1,6 +1,7 @@
 name: 自動處理課堂筆記 PDF
 
 on:
+  workflow_dispatch:
   push:
     paths:
       - 'incoming/**.pdf'
