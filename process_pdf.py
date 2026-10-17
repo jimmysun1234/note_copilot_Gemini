@@ -9,6 +9,9 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO_NAME = os.getenv("GITHUB_REPOSITORY")
 
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY 未設定，請檢查 Secrets。")
+
 client = genai.Client(api_key=GEMINI_API_KEY)
 gh = Github(GITHUB_TOKEN)
 repo = gh.get_repo(REPO_NAME)
@@ -37,7 +40,6 @@ def process_latest_pdf():
 
     print(f"正在處理檔案: {latest_pdf}")
 
-    # 上傳 PDF 至 Gemini
     uploaded_file = client.files.upload(file=latest_pdf)
 
     response = client.models.generate_content(
@@ -57,7 +59,6 @@ def process_latest_pdf():
     notes = data.get("notes", "")
     question = data.get("question")
 
-    # 組合 Markdown 筆記內容（避免 triple quotes 衝突）
     prompt_block = (
         "```markdown\n"
         f"你現在是該領域的教學專家。請根據上述「{base_name}」的筆記內容，出 3 題觀念驗證題（包含 1 題陷阱選擇題與 2 題推導/問答題），並附上詳細詳解與評分標準。\n"
@@ -78,7 +79,6 @@ def process_latest_pdf():
         f.write(final_content)
     print(f"筆記已成功寫入 {output_md_path}")
 
-    # 若有缺漏則開 Issue 發問
     if question:
         issue_title = f"【筆記待補全】{pdf_name} 內容確認"
         issue_body = (
