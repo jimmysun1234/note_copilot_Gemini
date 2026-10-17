@@ -5,6 +5,7 @@ on:
   push:
     paths:
       - '原始檔案/**.pdf'
+      - 'incoming/**.pdf'
 
 jobs:
   process-notes:
