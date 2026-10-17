@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - 'incoming/**.pdf'
+      - '原始檔案/**.pdf'
 
 jobs:
   process-notes:
