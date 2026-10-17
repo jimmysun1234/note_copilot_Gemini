@@ -30,7 +30,6 @@ def process_latest_pdf():
         print("未在 incoming/ 找到任何 PDF 檔案。")
         return
 
-    # 取得最新上傳的 PDF 檔案
     latest_pdf = max(pdf_files, key=os.path.getctime)
     pdf_name = os.path.basename(latest_pdf)
     base_name = os.path.splitext(pdf_name)[0]
@@ -58,18 +57,39 @@ def process_latest_pdf():
     notes = data.get("notes", "")
     question = data.get("question")
 
-    final_content = f"""# 課堂筆記：{base_name}
+    # 組合 Markdown 筆記內容（避免 triple quotes 衝突）
+    prompt_block = (
+        "```markdown\n"
+        f"你現在是該領域的教學專家。請根據上述「{base_name}」的筆記內容，出 3 題觀念驗證題（包含 1 題陷阱選擇題與 2 題推導/問答題），並附上詳細詳解與評分標準。\n"
+        "```"
+    )
 
-## 📌 3 分鐘核心摘要
-{summary}
+    final_content = (
+        f"# 課堂筆記：{base_name}\n\n"
+        f"## 📌 3 分鐘核心摘要\n{summary}\n\n"
+        f"---\n\n"
+        f"## 📖 結構化重點筆記\n{notes}\n\n"
+        f"---\n\n"
+        f"## 💡 後續複習提示詞 (Prompt)\n{prompt_block}\n"
+    )
 
----
+    os.makedirs("notes", exist_ok=True)
+    with open(output_md_path, "w", encoding="utf-8") as f:
+        f.write(final_content)
+    print(f"筆記已成功寫入 {output_md_path}")
 
-## 📖 結構化重點筆記
-{notes}
+    # 若有缺漏則開 Issue 發問
+    if question:
+        issue_title = f"【筆記待補全】{pdf_name} 內容確認"
+        issue_body = (
+            "### AI 學習助理提問\n"
+            f"在閱讀 `{pdf_name}` 時發現部分內容需釐清：\n\n"
+            f"> **{question}**\n\n"
+            "---\n"
+            f"💡 **回覆說明**：直接在此 Issue 留言回答，補全資訊將會在後續整合至 `{output_md_path}`。\n"
+        )
+        repo.create_issue(title=issue_title, body=issue_body)
+        print(f"已針對缺漏建立 Issue 發問: {issue_title}")
 
----
-
-## 💡 後續複習提示詞 (Prompt)
-```markdown
-你現在是該領域的教學專家。請根據上述「{base_name}」的筆記內容，出 3 題觀念驗證題（包含 1 題陷阱選擇題與 2 題推導/問答題），並附上詳細詳解與評分標準。
+if __name__ == "__main__":
+    process_latest_pdf()
