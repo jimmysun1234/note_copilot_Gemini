@@ -27,16 +27,30 @@ class UpdateOutput(BaseModel):
 def fix_github_latex(text: str) -> str:
     if not text:
         return ""
-    text = text.replace("\t", "\\t").replace("\b", "\\b").replace("\f", "\\f");
-    def strip_inner_math(match):
-        return f"${match.group(1).strip()}$"
-    text = re.sub(r'(?<!\$)\$(?!\$)([^\$\n]+?)(?<!\$)\$(?!\$)', strip_inner_math, text);
-    text = re.sub(r'\((\$[^\$\n]+\$)\)', r'（\1）', text);
-    text = re.sub(r'\((\$[^\$\n]+\$)', r'( \1', text);
-    text = re.sub(r'(\$[^\$\n]+\$)\)', r'\1 )', text);
-    text = re.sub(r'([^\n])\s*\$\$([\s\S]+?)\$\$', r'\1\n\n$$\2$$', text);
-    text = re.sub(r'\$\$([\s\S]+?)\$\$\s*([^\n])', r'$$\1$$\n\n\2', text);
-    return text
+    # 1. 修復被 JSON 誤轉義的控制字元（如 \to, \beta, \frac, \right）
+    text = text.replace("\t", "\\t").replace("\b", "\\b").replace("\f", "\\f").replace("\r", "");
+
+    # 2. 處理區塊公式 $$...$$：移除內部多餘空行，並強制讓開頭與結尾的 $$ 獨立成行
+    def format_block_math(match):
+        content = match.group(1).strip()
+        # 移除公式塊內部的空行（GitHub 遇到空行會中斷數學渲染）
+        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        clean_content = "\n".join(lines)
+        return f"\n\n$$\n{clean_content}\n$$\n\n"
+
+    text = re.sub(r'\$\$([\s\S]+?)\$\$', format_block_math, text);
+
+    # 3. 處理行內公式 $...$：去除 $ 內側空白，並在 $ 外側前後強制加上半形空白（解決中文字與全形括號緊貼問題）
+    def format_inline_math(match):
+        inner = match.group(1).strip()
+        return f" ${inner}$ "
+
+    text = re.sub(r'(?<!\$)\$(?!\$)([^\$\n]+?)(?<!\$)\$(?!\$)', format_inline_math, text);
+
+    # 4. 清理多餘的連續空白與過多空行
+    text = re.sub(r'[ ]{2,}', ' ', text);
+    text = re.sub(r'\n{3,}', '\n\n', text);
+    return text.strip()
 
 def call_gemini_with_retry(contents, config, max_retries=5):
     for attempt in range(1, max_retries + 1):
