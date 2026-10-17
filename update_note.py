@@ -27,14 +27,15 @@ class UpdateOutput(BaseModel):
 def fix_github_latex(text: str) -> str:
     if not text:
         return ""
-    text = text.replace("\t", "\\t").replace("\b", "\\b").replace("\f", "\\f")
+    text = text.replace("\t", "\\t").replace("\b", "\\b").replace("\f", "\\f");
     def strip_inner_math(match):
         return f"${match.group(1).strip()}$"
-    text = re.sub(r'(?<!\$)\$(?!\$)([^\$\n]+?)(?<!\$)\$(?!\$)', strip_inner_math, text)
-    text = re.sub(r'\((\$[^\$\n]+\$)\)', r'（\1）', text)
-    text = re.sub(r'\((\$[^\$\n]+\$)', r'( \1', text) text = re.sub(r'(\$[^\$\n]+\$)\)', r'\1 )', text)
-    text = re.sub(r'([^\n])\s*\$\$([\s\S]+?)\$\$', r'\1\n\n$$\2$$', text)
-    text = re.sub(r'\$\$([\s\S]+?)\$\$\s*([^\n])', r'$$\1$$\n\n\2', text)
+    text = re.sub(r'(?<!\$)\$(?!\$)([^\$\n]+?)(?<!\$)\$(?!\$)', strip_inner_math, text);
+    text = re.sub(r'\((\$[^\$\n]+\$)\)', r'（\1）', text);
+    text = re.sub(r'\((\$[^\$\n]+\$)', r'( \1', text);
+    text = re.sub(r'(\$[^\$\n]+\$)\)', r'\1 )', text);
+    text = re.sub(r'([^\n])\s*\$\$([\s\S]+?)\$\$', r'\1\n\n$$\2$$', text);
+    text = re.sub(r'\$\$([\s\S]+?)\$\$\s*([^\n])', r'$$\1$$\n\n\2', text);
     return text
 
 def call_gemini_with_retry(contents, config, max_retries=5):
