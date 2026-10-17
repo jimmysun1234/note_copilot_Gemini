@@ -1,6 +1,7 @@
 import os
 import glob
 import json
+from datetime import datetime, timezone, timedelta
 from pydantic import BaseModel, Field
 from typing import Optional
 from google import genai
@@ -16,8 +17,9 @@ if not GEMINI_API_KEY:
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# 定義嚴格的輸出資料結構，杜絕 JSON 解析錯誤或 LaTeX 反斜線跳脫崩潰
+# 定義輸出結構，新增 topic 欄位讓 AI 自動抓取本堂課核心主題作為標題
 class NoteOutput(BaseModel):
+    topic: str = Field(description="用 5~12 個字精簡概括這份板書的核心主題（做為標題用）")
     summary: str = Field(description="3~5 個重點的核心精華摘要 (Markdown 格式)")
     notes: str = Field(description="完整的結構化筆記，包含章節、公式推導、關鍵觀念、範例 (Markdown 格式)")
     question: Optional[str] = Field(default=None, description="如果板書有缺漏、遮蔽、筆跡模糊或邏輯中斷，請提出『一個』最關鍵的具體問題向使用者確認。如果內容完整無缺漏，請填 null。")
@@ -36,7 +38,17 @@ def process_latest_pdf():
     latest_pdf = max(pdf_files, key=os.path.getctime)
     pdf_name = os.path.basename(latest_pdf)
     base_name = os.path.splitext(pdf_name)[0]
-    output_md_path = f"notes/{base_name}.md"
+
+    # 設定台灣時區 (UTC+8)
+    tz_tw = timezone(timedelta(hours=8))
+    now_tw = datetime.now(tz_tw)
+    date_str = now_tw.strftime("%Y-%m-%d")
+    time_str = now_tw.strftime("%H:%M")
+    weekdays = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
+    weekday_str = weekdays[now_tw.weekday()]
+
+    # 檔名加入日期前綴，方便按時間排序閱讀
+    output_md_path = f"notes/{date_str}_{base_name}.md"
 
     print(f"正在處理檔案: {latest_pdf}")
 
@@ -48,12 +60,11 @@ def process_latest_pdf():
         mime_type="application/pdf"
     )
 
-    # 調用最新的 gemini-3.8-flash 模型並強制結構化輸出
     response = client.models.generate_content(
         model="gemini-3.8-flash",
         contents=[
             pdf_part,
-            "請詳細閱讀這份板書 PDF，並依照規範產出摘要、完整結構化筆記與單題缺漏提問。"
+            "請詳細閱讀這份板書 PDF，並依照規範產出核心主題、摘要、完整結構化筆記與單題缺漏提問。"
         ],
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
@@ -62,26 +73,31 @@ def process_latest_pdf():
         )
     )
 
-    # 安全解析回傳結果
     if response.parsed:
         result = response.parsed
+        topic = result.topic
         summary = result.summary
         notes = result.notes
         question = result.question
     else:
         data = json.loads(response.text)
+        topic = data.get("topic", base_name)
         summary = data.get("summary", "")
         notes = data.get("notes", "")
         question = data.get("question")
 
+    # 組合帶有時間與主題的標題
+    header_title = f"# 📅 {date_str} ({weekday_str}) {time_str}｜{base_name}：{topic}"
+
     prompt_block = (
         "```markdown\n"
-        f"你現在是該領域的教學專家。請根據上述「{base_name}」的筆記內容，出 3 題觀念驗證題（包含 1 題陷阱選擇題與 2 題推導/問答題），並附上詳細詳解與評分標準。\n"
+        f"你現在是該領域的教學專家。請根據上述「{base_name} - {topic}」的筆記內容，出 3 題觀念驗證題（包含 1 題陷阱選擇題與 2 題推導/問答題），並附上詳細詳解與評分標準。\n"
         "```"
     )
 
     final_content = (
-        f"# 課堂筆記：{base_name}\n\n"
+        f"{header_title}\n"
+        f"> **原始檔案**：`incoming/{pdf_name}`\n\n"
         f"## 📌 3 分鐘核心摘要\n{summary}\n\n"
         f"---\n\n"
         f"## 📖 結構化重點筆記\n{notes}\n\n"
@@ -94,13 +110,12 @@ def process_latest_pdf():
         f.write(final_content)
     print(f"✅ 筆記已成功寫入 {output_md_path}")
 
-    # 若有缺漏則建立 Issue 發問（加上 try-except 確保絕不影響筆記產出）
     if question and str(question).strip().lower() != "null":
         try:
             auth = Auth.Token(GITHUB_TOKEN)
             gh = Github(auth=auth)
             repo = gh.get_repo(REPO_NAME)
-            issue_title = f"【筆記待補全】{pdf_name} 內容確認"
+            issue_title = f"【筆記待補全】{date_str} {base_name} ({topic})"
             issue_body = (
                 "### AI 學習助理提問\n"
                 f"在閱讀 `{pdf_name}` 時發現部分內容需釐清：\n\n"
