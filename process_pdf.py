@@ -3,7 +3,7 @@ import glob
 import json
 from google import genai
 from google.genai import types
-from github import Github
+from github import Github, Auth
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
@@ -13,7 +13,8 @@ if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY 未設定，請檢查 Secrets。")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
-gh = Github(GITHUB_TOKEN)
+auth = Auth.Token(GITHUB_TOKEN)
+gh = Github(auth=auth)
 repo = gh.get_repo(REPO_NAME)
 
 SYSTEM_PROMPT = """
@@ -40,12 +41,19 @@ def process_latest_pdf():
 
     print(f"正在處理檔案: {latest_pdf}")
 
-    uploaded_file = client.files.upload(file=latest_pdf)
+    # 直接讀取 PDF bytes，避開中文檔名在 HTTP Header 的 ASCII 編碼問題
+    with open(latest_pdf, "rb") as f:
+        pdf_bytes = f.read()
+
+    pdf_part = types.Part.from_bytes(
+        data=pdf_bytes,
+        mime_type="application/pdf"
+    )
 
     response = client.models.generate_content(
         model="gemini-2.5-flash",
         contents=[
-            uploaded_file,
+            pdf_part,
             "請閱讀這份板書 PDF，並依照規範產出摘要、筆記結構與缺漏提問。"
         ],
         config=types.GenerateContentConfig(
