@@ -35,7 +35,8 @@ def process_comment():
     
     note_path = match_note.group(1)
     pdf_name = match_pdf.group(1) if match_pdf else ""
-    pdf_path = f"incoming/{pdf_name}" if pdf_name else ""
+    match_pdf = re.search(r"在閱讀 `([^`]+\.pdf)`", issue.body)
+    pdf_path = match_pdf.group(1) if match_pdf else ""
 
     if not os.path.exists(note_path):
         print(f"找不到筆記檔案: {note_path}")
