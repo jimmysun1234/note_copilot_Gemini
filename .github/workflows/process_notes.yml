@@ -1,0 +1,40 @@
+name: 自動處理課堂筆記 PDF
+
+on:
+  push:
+    paths:
+      - 'incoming/**.pdf'
+
+jobs:
+  process-notes:
+   runs-on: ubuntu-latest
+   permissions:
+     contents: write
+     issues: write
+
+   steps:
+     - name: 檢出儲存庫代碼
+       uses: actions/checkout@v4
+
+     - name: 設定 Python 環境
+       uses: setup-python@v5
+       with:
+         python-version: '3.11'
+
+     - name: 安裝相依套件
+       run: |
+         pip install -r requirements.txt
+
+     - name: 執行筆記處理與 AI 生成
+       env:
+         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+       run: |
+         python process_pdf.py
+
+     - name: 自動 Commit 並 Push 生成的 Markdown 筆記
+       run: |
+         git config --global user.name "github-actions[bot]"
+         git config --global user.email "github-actions[bot]@users.noreply.github.com"
+         git add notes/
+         git diff --quiet && git diff --staged --quiet || (git commit -m "docs: 自動生成課堂筆記 [skip ci]" && git push)
