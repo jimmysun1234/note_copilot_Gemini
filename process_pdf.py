@@ -30,9 +30,9 @@ SYSTEM_PROMPT = """
 
 【GitHub LaTeX 公式排版嚴格規範（極重要）】：
 1. 行內公式請使用單個錢字號 `$公式$`，獨立區塊公式請使用雙錢字號 `$$公式$$` 並前後空行。
-2. 絕對禁止將 `$公式$` 放在半形括號 `(...)` 內緊貼，若需括號請一律使用全形中文括號 `（$公式$）`，或在括號內側留空白 `( $公式$ )`。
+2. 絕對禁止將 `$公式$` 放在半形括號 `(...)` 內緊貼，若需括號請一律使用全形中文括號 `（$公式$）`。
 3. `$` 符號的內側開頭與結尾絕對不可有空格（正確：`$L \\to \\infty$`，錯誤：`$ L \\to \\infty $`）。
-4. 嚴禁在 Markdown 標題（`#`, `##`, `###`）或粗體（`**...**`）內部嵌套 `$公式$`，以免 GitHub 渲染失效。
+4. 嚴禁在 Markdown 標題（`#`, `##`, `###`）或粗體（`**...**`）內部嵌套 `$公式$`。
 """
 
 def fix_github_latex(text: str) -> str:
@@ -40,22 +40,21 @@ def fix_github_latex(text: str) -> str:
     if not text:
         return ""
     
-    # 1. 修復被 JSON 誤轉義的控制字元（例如 \to 的 \t 被變成 tab, \beta 的 \b 被變成退格, \frac 的 \f 被變成換頁）
-    text = text.replace("\t", "\\t").replace("\b", "\\b").replace("\f", "\\f")
+    # 1. 修復被 JSON 誤轉義的控制字元（如 \to, \beta, \frac）
+    text = text.replace("\t", "\\t").replace("\b", "\\b").replace("\f", "\\f");
     
     # 2. 修正行內公式內側多餘空白：將 $xxx$ 修正為 $xxx$
     def strip_inner_math(match):
-        inner = match.group(1).strip()
-        return f"${inner}$"
-    text = re.sub(r'(?<!\$)\$(?!\$)([^\$\n]+?)(?<!\$)\$(?!\$)', strip_inner_math, text)
+        return f"${match.group(1).strip()}$"
+    text = re.sub(r'(?<!\$)\$(?!\$)([^\$\n]+?)(?<!\$)\$(?!\$)', strip_inner_math, text);
 
-    # 3. 解決半形括號緊貼 $ 導致 GitHub 無法渲染的問題：將 ($...$) 轉為 （$...$） 或補空白
-    text = re.sub(r'\((\$[^\$\n]+\$)\)', r'（\1）', text)
-    text = re.sub(r'\((\$[^\$\n]+\$)', r'( \1', text) text = re.sub(r'(\$[^\$\n]+\$)\)', r'\1 )', text)
+    # 3. 解決半形括號緊貼 $ 導致 GitHub 無法渲染的問題
+    text = re.sub(r'\((\$[^\$\n]+\$)\)', r'（\1）', text);
+    text = re.sub(r'\((\$[^\$\n]+\$)', r'( \1', text); text = re.sub(r'(\$[^\$\n]+\$)\)', r'\1 )', text);
 
     # 4. 確保獨立公式區塊 $$ 前後都有換行
-    text = re.sub(r'([^\n])\s*\$\$([\s\S]+?)\$\$', r'\1\n\n$$\2$$', text)
-    text = re.sub(r'\$\$([\s\S]+?)\$\$\s*([^\n])', r'$$\1$$\n\n\2', text)
+    text = re.sub(r'([^\n])\s*\$\$([\s\S]+?)\$\$', r'\1\n\n$$\2$$', text);
+    text = re.sub(r'\$\$([\s\S]+?)\$\$\s*([^\n])', r'$$\1$$\n\n\2', text);
 
     return text
 
@@ -143,7 +142,6 @@ def process_latest_pdf():
         notes = data.get("notes", "")
         question = data.get("question")
 
-    # 執行 LaTeX 公式自動校正，確保渲染無誤
     summary = fix_github_latex(summary)
     notes = fix_github_latex(notes)
     if question:
