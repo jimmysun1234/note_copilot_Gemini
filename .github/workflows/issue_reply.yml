@@ -1,0 +1,44 @@
+name: 處理 Issue 回覆並更新筆記
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  update-note:
+    # 只有當人類使用者留言時才觸發（避免 AI 自己留言無限迴圈）
+    if: github.event.issue.pull_request == null && github.event.comment.user.type != 'Bot'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+
+    steps:
+      - name: 檢出儲存庫代碼
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: 設定 Python 環境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安裝相依套件
+        run: |
+          pip install -r requirements.txt
+
+      - name: 根據留言更新筆記
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          python update_note.py
+
+      - name: 自動 Commit 並 Push 更新後的筆記
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add notes/
+          git diff --quiet && git diff --staged --quiet || (git commit -m "docs: 根據 Issue 回覆更新課堂筆記 [skip ci]" && git push)
