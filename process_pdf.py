@@ -1,4 +1,5 @@
 import os
+import re
 import glob
 import json
 import time
@@ -26,11 +27,39 @@ class NoteOutput(BaseModel):
 
 SYSTEM_PROMPT = """
 你是一位專業的高效學習助理與知識工程師。你的任務是閱讀使用者上傳的課堂板書/筆記 PDF，將其整理為條理分明、概念嚴謹的 Markdown 筆記。
-若有數學或電路公式，請使用標準 LaTeX 語法（如 $...$ 或 $$...$$）呈現。
+
+【GitHub LaTeX 公式排版嚴格規範（極重要）】：
+1. 行內公式請使用單個錢字號 `$公式$`，獨立區塊公式請使用雙錢字號 `$$公式$$` 並前後空行。
+2. 絕對禁止將 `$公式$` 放在半形括號 `(...)` 內緊貼，若需括號請一律使用全形中文括號 `（$公式$）`，或在括號內側留空白 `( $公式$ )`。
+3. `$` 符號的內側開頭與結尾絕對不可有空格（正確：`$L \\to \\infty$`，錯誤：`$ L \\to \\infty $`）。
+4. 嚴禁在 Markdown 標題（`#`, `##`, `###`）或粗體（`**...**`）內部嵌套 `$公式$`，以免 GitHub 渲染失效。
 """
 
+def fix_github_latex(text: str) -> str:
+    """自動修正 GitHub Markdown 的 LaTeX 渲染地雷，確保 100% 正常顯示"""
+    if not text:
+        return ""
+    
+    # 1. 修復被 JSON 誤轉義的控制字元（例如 \to 的 \t 被變成 tab, \beta 的 \b 被變成退格, \frac 的 \f 被變成換頁）
+    text = text.replace("\t", "\\t").replace("\b", "\\b").replace("\f", "\\f")
+    
+    # 2. 修正行內公式內側多餘空白：將 $xxx$ 修正為 $xxx$
+    def strip_inner_math(match):
+        inner = match.group(1).strip()
+        return f"${inner}$"
+    text = re.sub(r'(?<!\$)\$(?!\$)([^\$\n]+?)(?<!\$)\$(?!\$)', strip_inner_math, text)
+
+    # 3. 解決半形括號緊貼 $ 導致 GitHub 無法渲染的問題：將 ($...$) 轉為 （$...$） 或補空白
+    text = re.sub(r'\((\$[^\$\n]+\$)\)', r'（\1）', text)
+    text = re.sub(r'\((\$[^\$\n]+\$)', r'( \1', text) text = re.sub(r'(\$[^\$\n]+\$)\)', r'\1 )', text)
+
+    # 4. 確保獨立公式區塊 $$ 前後都有換行
+    text = re.sub(r'([^\n])\s*\$\$([\s\S]+?)\$\$', r'\1\n\n$$\2$$', text)
+    text = re.sub(r'\$\$([\s\S]+?)\$\$\s*([^\n])', r'$$\1$$\n\n\2', text)
+
+    return text
+
 def call_gemini_with_retry(contents, config, max_retries=5):
-    """遇到 503 伺服器繁忙或 429 限制時，自動等待並重試"""
     for attempt in range(1, max_retries + 1):
         try:
             return client.models.generate_content(
@@ -42,13 +71,12 @@ def call_gemini_with_retry(contents, config, max_retries=5):
             err_msg = str(e)
             if ("503" in err_msg or "429" in err_msg or "UNAVAILABLE" in err_msg) and attempt < max_retries:
                 wait_sec = attempt * 10
-                print(f"⚠️ Google 伺服器目前忙碌中 (第 {attempt}/{max_retries} 次嘗試)，等待 {wait_sec} 秒後自動重試...")
+                print(f"⚠️ Google 伺服器忙碌中 (第 {attempt}/{max_retries} 次嘗試)，等待 {wait_sec} 秒後重試...")
                 time.sleep(wait_sec)
             else:
                 raise e
 
 def process_latest_pdf():
-    # 同時支援「原始檔案/」與「incoming/」兩個資料夾
     pdf_files = glob.glob("原始檔案/**/*.pdf", recursive=True) + glob.glob("incoming/**/*.pdf", recursive=True)
     if not pdf_files:
         print("未在 原始檔案/ 或 incoming/ 找到任何 PDF 檔案。")
@@ -58,7 +86,6 @@ def process_latest_pdf():
     pdf_name = os.path.basename(latest_pdf)
     base_name = os.path.splitext(pdf_name)[0]
 
-    # 判斷科目名稱（優先看子資料夾名稱，其次看檔名底線前綴）
     root_folder = "原始檔案" if latest_pdf.startswith("原始檔案") else "incoming"
     rel_dir = os.path.dirname(os.path.relpath(latest_pdf, root_folder))
     if rel_dir and rel_dir != ".":
@@ -68,7 +95,6 @@ def process_latest_pdf():
     else:
         subject = "一般科目"
 
-    # 設定台灣時區 (UTC+8)
     tz_tw = timezone(timedelta(hours=8))
     now_tw = datetime.now(tz_tw)
     date_str = now_tw.strftime("%Y-%m-%d")
@@ -76,7 +102,6 @@ def process_latest_pdf():
     weekdays = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
     weekday_str = weekdays[now_tw.weekday()]
 
-    # 按科目與日期建立筆記路徑
     output_dir = f"notes/{subject}"
     os.makedirs(output_dir, exist_ok=True)
     output_md_path = f"{output_dir}/{date_str}_{base_name}.md"
@@ -100,7 +125,7 @@ def process_latest_pdf():
     response = call_gemini_with_retry(
         contents=[
             pdf_part,
-            f"這是一份「{subject}」科目的板書 PDF，請詳細閱讀並依照規範產出核心主題、摘要、完整結構化筆記與單題缺漏提問。"
+            f"這是一份「{subject}」科目的板書 PDF，請詳細閱讀並依照規範產出核心主題、摘要、完整結構化筆記與單題缺漏提問。請特別注意 LaTeX 公式不要緊貼半形括號。"
         ],
         config=config
     )
@@ -117,6 +142,12 @@ def process_latest_pdf():
         summary = data.get("summary", "")
         notes = data.get("notes", "")
         question = data.get("question")
+
+    # 執行 LaTeX 公式自動校正，確保渲染無誤
+    summary = fix_github_latex(summary)
+    notes = fix_github_latex(notes)
+    if question:
+        question = fix_github_latex(question)
 
     header_title = f"# 📅 {date_str} ({weekday_str}) {time_str}｜【{subject}】{topic}"
 
