@@ -191,4 +191,113 @@ def process_latest_pdf():
     output_dir = f"notes/{subject}"
     asset_dir = f"{output_dir}/assets"
     os.makedirs(asset_dir, exist_ok=True)
-    output_md_path = f"{output_dir}/{date_str}_{base_name
+    output_md_path = f"{output_dir}/{date_str}_{base_name}.md"
+
+    print(f"正在處理檔案: {latest_pdf} (科目: {subject}, 日期: {date_str})")
+
+    with open(latest_pdf, "rb") as f:
+        pdf_bytes = f.read()
+
+    pdf_part = types.Part.from_bytes(
+        data=pdf_bytes,
+        mime_type="application/pdf"
+    )
+
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        response_mime_type="application/json",
+        response_schema=NoteOutput,
+    )
+
+    response = call_gemini_with_retry(
+        contents=[
+            pdf_part,
+            f"這是一份「{subject}」科目於 {date_str} 的板書/講義 PDF，請詳細閱讀並產出核心主題、摘要、完整結構化筆記、關鍵圖表裁切座標（diagrams）與單題缺漏提問。"
+        ],
+        config=config
+    )
+
+    if response.parsed:
+        result = response.parsed
+        topic = result.topic
+        summary = result.summary
+        notes = result.notes
+        diagrams = result.diagrams or []
+        question = result.question
+    else:
+        data = json.loads(response.text)
+        topic = data.get("topic", base_name)
+        summary = data.get("summary", "")
+        notes = data.get("notes", "")
+        diagrams = data.get("diagrams", [])
+        question = data.get("question")
+
+    prefix = f"{date_str}_{base_name}"
+    fig_map, full_pages = extract_and_optimize_images(latest_pdf, asset_dir, prefix, diagrams)
+
+    for placeholder, md_img in fig_map.items():
+        if placeholder in notes:
+            notes = notes.replace(placeholder, md_img)
+        else:
+            notes += f"\n{md_img}"
+
+    notes = re.sub(r'\{\{FIG_\d+\}\}', '', notes)
+
+    summary = fix_github_latex(summary)
+    notes = fix_github_latex(notes)
+    if question:
+        question = fix_github_latex(question)
+
+    pages_gallery_md = "\n".join([f"#### 📄 第 {p_num} 頁\n![第 {p_num} 頁]({p_path})\n" for p_num, p_path in full_pages])
+    gallery_section = (
+        "## 🖼️ 原始板書/講義高畫質對照（已自動去陰影與銳利化）\n"
+        "<details>\n"
+        "<summary>👉 點此展開查看完整板書原圖（共 " + str(len(full_pages)) + " 頁）</summary>\n\n"
+        f"{pages_gallery_md}\n"
+        "</details>\n"
+    )
+
+    header_title = f"# 📅 {date_str} ({weekday_str})｜【{subject}】{topic}"
+
+    prompt_block = (
+        "```markdown\n"
+        f"你現在是「{subject}」領域的教學專家。請根據上述「{topic}」的筆記內容，出 3 題觀念驗證題（包含 1 題陷阱選擇題與 2 題推導/問答題），並附上詳細詳解與評分標準。\n"
+        "```"
+    )
+
+    final_content = (
+        f"{header_title}\n"
+        f"> **科目**：`{subject}` ｜ **上課日期**：`{date_str}` ｜ **原始檔案**：`{latest_pdf}`\n\n"
+        f"## 📌 3 分鐘核心摘要\n{summary}\n\n"
+        f"---\n\n"
+        f"## 📖 結構化重點筆記（含自動剪貼圖表）\n{notes}\n\n"
+        f"---\n\n"
+        f"{gallery_section}\n"
+        f"---\n\n"
+        f"## 💡 後續複習提示詞 (Prompt)\n{prompt_block}\n"
+    )
+
+    with open(output_md_path, "w", encoding="utf-8") as f:
+        f.write(final_content)
+    print(f"✅ 筆記與優化圖片已成功寫入 {output_md_path}")
+
+    if question and str(question).strip().lower() != "null":
+        try:
+            auth = Auth.Token(GITHUB_TOKEN)
+            gh = Github(auth=auth)
+            repo = gh.get_repo(REPO_NAME)
+            issue_title = f"【{subject}｜筆記待補全】{date_str} {topic}"
+            issue_body = (
+                "### AI 學習助理提問\n"
+                f"在閱讀 `{latest_pdf}` 時發現部分內容需釐清：\n\n"
+                f"> **{question}**\n\n"
+                "---\n"
+                f"💡 **回覆說明**：直接在此 Issue 留言回答，補全資訊將會在後續整合至 `{output_md_path}`。\n"
+            )
+            repo.create_issue(title=issue_title, body=issue_body)
+            print(f"✅ 已針對缺漏建立 Issue 發問: {issue_title}")
+        except Exception as e:
+            print(f"⚠️ 建立 Issue 時發生警告（不影響筆記儲存）: {e}")
+
+if __name__ == "__main__":
+    process_latest_pdf()
