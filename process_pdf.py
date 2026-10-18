@@ -1,13 +1,12 @@
 import os
 import re
+import io
 import glob
 import json
 import time
 import pymupdf
 from PIL import Image, ImageEnhance, ImageOps
 from datetime import datetime, timezone, timedelta
-from pydantic import BaseModel, Field
-from typing import Optional, List
 from google import genai
 from google.genai import types
 from github import Github, Auth
@@ -21,21 +20,23 @@ if not GEMINI_API_KEY:
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# 採用單層扁平化 Schema，無嵌套類別、無 default 複雜預設值，100% 符合 Gemini API 規範
-class NoteOutput(BaseModel):
-    topic: str = Field(description="用 5~12 個字精簡概括這份板書的核心主題（做為標題用）")
-    summary: str = Field(description="3~5 個重點的核心精華摘要 (Markdown 格式)")
-    notes: str = Field(description="完整的結構化筆記。請在需要放原圖表的位置插入對應的 {{FIG_1}}、{{FIG_2}} 標記；若是方塊圖或流程圖，亦可搭配 ```mermaid 語法重繪。")
-    diagrams: List[str] = Field(description="從 PDF 擷取的關鍵電路圖或波形圖清單。每個元素格式必須嚴格為：'頁碼|ymin,xmin,ymax,xmax|圖表說明|{{FIG_X}}'，例如 '1|150,100,550,900|半波整流電路與波形|{{FIG_1}}'。座標範圍 0~1000。若無圖表請回傳空陣列 []。")
-    question: Optional[str] = Field(description="如果板書有缺漏、遮蔽、筆跡模糊或邏輯中斷，請提出『一個』最關鍵的具體問題向使用者確認。如果內容完整無缺漏，請填 null。")
-
 SYSTEM_PROMPT = """
-你是一位專業的高效學習助理與知識工程師。你的任務是閱讀使用者上傳的課堂板書/筆記 PDF，將其整理為條理分明、概念嚴謹的 Markdown 筆記。
+你是一位專業的高效學習助理與知識工程師。你的任務是閱讀使用者上傳的課堂板書/講義圖片，將其整理為條理分明、概念嚴謹的 Markdown 筆記。
 
-【圖表剪貼與視覺化規範】：
-1. 若板書或講義中含有重要的「電路圖、波形圖、相量圖、結構圖」，請在 `diagrams` 陣列中回傳字串，格式嚴格為：`頁碼|ymin,xmin,ymax,xmax|圖表標題|{{FIG_1}}`（座標為 0~1000 整數比例），並在 `notes` 內文最合適的段落處插入對應的 `{{FIG_1}}`、`{{FIG_2}}` 標記。
-2. 擷取座標時請稍微留一點邊距，確保座標軸文字、元件標號（如 $V_s, L_c, i_o$）完整包含在框內。
-3. 若內容包含控制方塊圖或流程，也歡迎在筆記中使用 GitHub 支援的 ```mermaid 語法繪製清晰圖表輔助說明。
+請嚴格輸出合法的 JSON 格式（不要加任何其他說明文字），結構與欄位如下：
+{
+  "topic": "用 5~12 個字精簡概括這份板書的核心主題（做為標題用）",
+  "summary": "3~5 個重點的核心精華摘要 (Markdown 格式)",
+  "notes": "完整的結構化筆記。請在需要放入板書原圖表的位置插入 {{FIG_1}}、{{FIG_2}} 標記；若是方塊圖或流程圖，亦可搭配 ```mermaid 語法重繪。",
+  "diagrams": [
+    "頁碼|ymin,xmin,ymax,xmax|圖表標題說明|{{FIG_1}}"
+  ],
+  "question": "如果板書有缺漏、遮蔽、筆跡模糊或邏輯中斷，請提出『一個』最關鍵的具體問題向使用者確認。如果內容完整無缺漏，請填 null。"
+}
+
+【圖表剪貼規範】：
+1. 若板書中含有重要的「電路圖、波形圖、相量圖、結構圖」，請在 `diagrams` 陣列中回傳字串，格式嚴格為：`頁碼|ymin,xmin,ymax,xmax|圖表標題|{{FIG_1}}`（頁碼從 1 開始，座標為 0~1000 整數比例），並在 `notes` 內文對應段落插入 `{{FIG_1}}`、`{{FIG_2}}`。若無圖表，`diagrams` 請填 `[]`。
+2. 擷取座標時請稍微留邊距，確保座標軸文字、元件標號（如 $V_s, L_c, i_o$）完整包含在框內。
 
 【GitHub LaTeX 公式排版嚴格規範（極重要）】：
 1. 行內公式請使用單個錢字號 `$公式$`，獨立區塊公式請使用雙錢字號 `$$公式$$` 並前後空行。
@@ -51,30 +52,47 @@ def enhance_board_image(pil_img: Image.Image) -> Image.Image:
     img = ImageEnhance.Sharpness(img).enhance(1.5)
     return img
 
-def extract_and_optimize_images(pdf_path: str, asset_dir: str, prefix: str, diagrams: List[str]):
-    """從 PDF 渲染高清頁面與局部裁切圖表，並回傳替換字典與全頁預覽清單"""
+def render_pdf_pages(pdf_path: str, asset_dir: str, prefix: str):
+    """將 PDF 每一頁轉成優化後的高清圖片，回傳圖片字典、全頁 Markdown 列表與 API 用的 Part 列表"""
     os.makedirs(asset_dir, exist_ok=True)
     doc = pymupdf.open(pdf_path)
-    fig_markdown_map = {}
-    full_page_md_list = []
-
-    # 1. 將每一頁存成高清優化圖
     page_images = {}
+    full_page_md_list = []
+    api_image_parts = []
+
     for page_idx in range(len(doc)):
         page = doc[page_idx]
         pix = page.get_pixmap(matrix=pymupdf.Matrix(2.0, 2.0), alpha=False)
         pil_img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
         opt_img = enhance_board_image(pil_img)
-        page_images[page_idx + 1] = opt_img
+        page_num = page_idx + 1
+        page_images[page_num] = opt_img
 
-        page_filename = f"{prefix}_page_{page_idx + 1}.png"
+        # 儲存給筆記顯示用的 PNG
+        page_filename = f"{prefix}_page_{page_num}.png"
         page_save_path = os.path.join(asset_dir, page_filename)
         opt_img.save(page_save_path, "PNG", optimize=True)
-        full_page_md_list.append((page_idx + 1, f"assets/{page_filename}"))
+        full_page_md_list.append((page_num, f"assets/{page_filename}"))
 
-    # 2. 解析字串並針對局部電路圖/波形圖進行精準剪貼
+        # 轉成 JPEG bytes 傳給 Gemini API（體積小、速度快、不會 400 報錯）
+        buf = io.BytesIO()
+        opt_img.save(buf, format="JPEG", quality=85)
+        api_image_parts.append(f"【第 {page_num} 頁板書圖片】：")
+        api_image_parts.append(types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"))
+
+    doc.close()
+    return page_images, full_page_md_list, api_image_parts
+
+def crop_diagrams(page_images: dict, asset_dir: str, prefix: str, diagrams: list):
+    """根據 AI 回傳的座標，從高清頁面剪貼局部電路圖/波形圖"""
+    fig_markdown_map = {}
+    if not isinstance(diagrams, list):
+        return fig_markdown_map
+
     for idx, item in enumerate(diagrams, start=1):
         try:
+            if not isinstance(item, str):
+                continue
             parts = [p.strip() for p in item.split("|")]
             if len(parts) < 3:
                 continue
@@ -115,8 +133,7 @@ def extract_and_optimize_images(pdf_path: str, asset_dir: str, prefix: str, diag
         except Exception as e:
             print(f"⚠️ 略過無法解析的圖表標記 ({item}): {e}")
 
-    doc.close()
-    return fig_markdown_map, full_page_md_list
+    return fig_markdown_map
 
 def fix_github_latex(text: str) -> str:
     if not text:
@@ -139,6 +156,18 @@ def fix_github_latex(text: str) -> str:
     text = re.sub(r'[ ]{2,}', ' ', text);
     text = re.sub(r'\n{3,}', '\n\n', text);
     return text.strip()
+
+def safe_parse_json(raw_text: str) -> dict:
+    """安全解析 JSON，處理可能殘留的 Markdown 標籤或反斜線問題"""
+    cleaned = raw_text.strip()
+    cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
+    cleaned = re.sub(r'\s*```$', '', cleaned)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        # 修復單一反斜線導致的 JSON 解析錯誤
+        fixed = re.sub(r'\\(?![/\"\\bfnrtu])', r'\\\\', cleaned)
+        return json.loads(fixed)
 
 def call_gemini_with_retry(contents, config, max_retries=5):
     for attempt in range(1, max_retries + 1):
@@ -195,46 +224,35 @@ def process_latest_pdf():
 
     print(f"正在處理檔案: {latest_pdf} (科目: {subject}, 日期: {date_str})")
 
-    with open(latest_pdf, "rb") as f:
-        pdf_bytes = f.read()
+    # 1. 先將 PDF 轉為高清優化圖片
+    prefix = f"{date_str}_{base_name}"
+    page_images, full_pages, api_image_parts = render_pdf_pages(latest_pdf, asset_dir, prefix)
 
-    pdf_part = types.Part.from_bytes(
-        data=pdf_bytes,
-        mime_type="application/pdf"
-    )
-
+    # 2. 不使用 response_schema，只用純 response_mime_type="application/json" 徹底杜絕 400 錯誤
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
         response_mime_type="application/json",
-        response_schema=NoteOutput,
+    )
+
+    prompt_text = (
+        f"以上是「{subject}」科目於 {date_str} 的板書/講義（共 {len(page_images)} 頁）。"
+        "請詳細閱讀並依照 JSON 規範產出 topic、summary、notes、diagrams（局部電路/波形圖座標）與 question。"
     )
 
     response = call_gemini_with_retry(
-        contents=[
-            pdf_part,
-            f"這是一份「{subject}」科目於 {date_str} 的板書/講義 PDF，請詳細閱讀並產出核心主題、摘要、完整結構化筆記、關鍵圖表裁切座標（diagrams）與單題缺漏提問。"
-        ],
+        contents=api_image_parts + [prompt_text],
         config=config
     )
 
-    if response.parsed:
-        result = response.parsed
-        topic = result.topic
-        summary = result.summary
-        notes = result.notes
-        diagrams = result.diagrams or []
-        question = result.question
-    else:
-        data = json.loads(response.text)
-        topic = data.get("topic", base_name)
-        summary = data.get("summary", "")
-        notes = data.get("notes", "")
-        diagrams = data.get("diagrams", [])
-        question = data.get("question")
+    data = safe_parse_json(response.text)
+    topic = data.get("topic", base_name)
+    summary = data.get("summary", "")
+    notes = data.get("notes", "")
+    diagrams = data.get("diagrams", [])
+    question = data.get("question")
 
-    prefix = f"{date_str}_{base_name}"
-    fig_map, full_pages = extract_and_optimize_images(latest_pdf, asset_dir, prefix, diagrams)
-
+    # 3. 執行局部圖表剪貼與替換
+    fig_map = crop_diagrams(page_images, asset_dir, prefix, diagrams)
     for placeholder, md_img in fig_map.items():
         if placeholder in notes:
             notes = notes.replace(placeholder, md_img)
@@ -246,7 +264,7 @@ def process_latest_pdf():
     summary = fix_github_latex(summary)
     notes = fix_github_latex(notes)
     if question:
-        question = fix_github_latex(question)
+        question = fix_github_latex(str(question))
 
     pages_gallery_md = "\n".join([f"#### 📄 第 {p_num} 頁\n![第 {p_num} 頁]({p_path})\n" for p_num, p_path in full_pages])
     gallery_section = (
@@ -281,7 +299,7 @@ def process_latest_pdf():
         f.write(final_content)
     print(f"✅ 筆記與優化圖片已成功寫入 {output_md_path}")
 
-    if question and str(question).strip().lower() != "null":
+    if question and str(question).strip().lower() not in ("null", "none", ""):
         try:
             auth = Auth.Token(GITHUB_TOKEN)
             gh = Github(auth=auth)
