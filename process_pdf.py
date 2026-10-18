@@ -25,7 +25,7 @@ SYSTEM_PROMPT = """
 
 請嚴格輸出合法的 JSON 格式（不要加任何其他說明文字），結構與欄位如下：
 {
-  "topic": "用 5~12 個字精簡概括這份板書的核心主題（做為標題用）",
+  "topic": "用 5~12 個字精簡概括這份板書的核心主題（做為檔案名稱與標題用，請勿包含斜線或特殊符號）",
   "summary": "3~5 個重點的核心精華摘要 (Markdown 格式)",
   "notes": "完整的結構化筆記。請在需要放入板書原圖表的位置插入 {{FIG_1}}、{{FIG_2}} 標記；若是方塊圖或流程圖，亦可搭配 ```mermaid 語法重繪。",
   "diagrams": [
@@ -45,7 +45,6 @@ SYSTEM_PROMPT = """
 """
 
 def is_valid_pdf(filepath: str) -> bool:
-    """檢查檔案是否為真正有效的 PDF（過濾掉用 Create new file 誤建的 0KB 空殼檔）"""
     if not os.path.exists(filepath) or os.path.getsize(filepath) < 100:
         return False
     try:
@@ -56,8 +55,13 @@ def is_valid_pdf(filepath: str) -> bool:
     except Exception:
         return False
 
+def sanitize_filename(name: str) -> str:
+    """清除不能當作檔案名稱的特殊字元（如 / \\ : * ? " < > | 與多餘空白）"""
+    cleaned = re.sub(r'[\\/:*?"<>|\r\n\t]+', '_', name.strip())
+    cleaned = re.sub(r'\s+', '_', cleaned)
+    return cleaned or "課堂筆記"
+
 def enhance_board_image(pil_img: Image.Image) -> Image.Image:
-    """優化板書與講義圖片：提升解析對比度、銳利化字跡與線條"""
     img = pil_img.convert("RGB")
     img = ImageOps.autocontrast(img, cutoff=1)
     img = ImageEnhance.Contrast(img).enhance(1.25)
@@ -65,7 +69,6 @@ def enhance_board_image(pil_img: Image.Image) -> Image.Image:
     return img
 
 def render_pdf_pages(pdf_path: str, asset_dir: str, prefix: str):
-    """將 PDF 每一頁轉成優化後的高清圖片"""
     os.makedirs(asset_dir, exist_ok=True)
     doc = pymupdf.open(pdf_path)
     page_images = {}
@@ -94,7 +97,6 @@ def render_pdf_pages(pdf_path: str, asset_dir: str, prefix: str):
     return page_images, full_page_md_list, api_image_parts
 
 def crop_diagrams(page_images: dict, asset_dir: str, prefix: str, diagrams: list):
-    """根據 AI 回傳的座標，從高清頁面剪貼局部電路圖/波形圖"""
     fig_markdown_map = {}
     if not isinstance(diagrams, list):
         return fig_markdown_map
@@ -197,13 +199,12 @@ def call_gemini_with_retry(contents, config, max_retries=5):
 def process_latest_pdf():
     all_pdfs = glob.glob("原始檔案/**/*.pdf", recursive=True) + glob.glob("incoming/**/*.pdf", recursive=True)
     
-    # 過濾掉空殼或損壞的 PDF，只保留真正有效的 PDF
     valid_pdfs = []
     for p in all_pdfs:
         if is_valid_pdf(p):
             valid_pdfs.append(p)
         else:
-            print(f"⚠️ 略過無效或空白的檔案（請確認是否用 Upload files 上傳）: {p}")
+            print(f"⚠️ 略過無效或空白的檔案: {p}")
 
     if not valid_pdfs:
         print("❌ 未找到任何有效的 PDF 檔案！請使用 Add file -> Upload files 上傳真正的 PDF。")
@@ -237,12 +238,12 @@ def process_latest_pdf():
     output_dir = f"notes/{subject}"
     asset_dir = f"{output_dir}/assets"
     os.makedirs(asset_dir, exist_ok=True)
-    output_md_path = f"{output_dir}/{date_str}_{base_name}.md"
 
     print(f"✅ 正在處理有效檔案: {latest_pdf} (科目: {subject}, 日期: {date_str})")
 
-    prefix = f"{date_str}_{base_name}"
-    page_images, full_pages, api_image_parts = render_pdf_pages(latest_pdf, asset_dir, prefix)
+    # 圖片檔名前綴使用日期與原檔名雜湊，避免重複
+    img_prefix = f"{date_str}_{sanitize_filename(base_name)}"
+    page_images, full_pages, api_image_parts = render_pdf_pages(latest_pdf, asset_dir, img_prefix)
 
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
@@ -251,7 +252,7 @@ def process_latest_pdf():
 
     prompt_text = (
         f"以上是「{subject}」科目於 {date_str} 的板書/講義（共 {len(page_images)} 頁）。"
-        "請詳細閱讀並依照 JSON 規範產出 topic、summary、notes、diagrams（局部電路/波形圖座標）與 question。"
+        "請詳細閱讀並依照 JSON 規範產出 topic（精準題目名稱）、summary、notes、diagrams（局部電路/波形圖座標）與 question。"
     )
 
     response = call_gemini_with_retry(
@@ -260,13 +261,26 @@ def process_latest_pdf():
     )
 
     data = safe_parse_json(response.text)
-    topic = data.get("topic", base_name)
+    topic = data.get("topic", "課堂重點整理").strip()
     summary = data.get("summary", "")
     notes = data.get("notes", "")
     diagrams = data.get("diagrams", [])
     question = data.get("question")
 
-    fig_map = crop_diagrams(page_images, asset_dir, prefix, diagrams)
+    # 🔥 關鍵修改：使用「日期 + AI 生成的題目 (topic)」作為最終輸出的 Markdown 檔名！
+    safe_topic = sanitize_filename(topic)
+    output_md_path = f"{output_dir}/{date_str}_{safe_topic}.md"
+
+    # 若之前有殘留「日期_日期.md」的舊檔，順便自動清理掉，讓資料夾保持乾淨
+    old_dup_path = f"{output_dir}/{date_str}_{base_name}.md"
+    if old_dup_path != output_md_path and os.path.exists(old_dup_path):
+        try:
+            os.remove(old_dup_path)
+            print(f"🧹 已自動清理舊檔名檔案: {old_dup_path}")
+        except Exception:
+            pass
+
+    fig_map = crop_diagrams(page_images, asset_dir, img_prefix, diagrams)
     for placeholder, md_img in fig_map.items():
         if placeholder in notes:
             notes = notes.replace(placeholder, md_img)
