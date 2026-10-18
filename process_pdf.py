@@ -44,6 +44,18 @@ SYSTEM_PROMPT = """
 3. 區塊公式 `$$` 內部絕對不能有空行，且開頭與結尾的 `$$` 必須獨佔一行。
 """
 
+def is_valid_pdf(filepath: str) -> bool:
+    """檢查檔案是否為真正有效的 PDF（過濾掉用 Create new file 誤建的 0KB 空殼檔）"""
+    if not os.path.exists(filepath) or os.path.getsize(filepath) < 100:
+        return False
+    try:
+        doc = pymupdf.open(filepath)
+        page_count = len(doc)
+        doc.close()
+        return page_count > 0
+    except Exception:
+        return False
+
 def enhance_board_image(pil_img: Image.Image) -> Image.Image:
     """優化板書與講義圖片：提升解析對比度、銳利化字跡與線條"""
     img = pil_img.convert("RGB")
@@ -53,7 +65,7 @@ def enhance_board_image(pil_img: Image.Image) -> Image.Image:
     return img
 
 def render_pdf_pages(pdf_path: str, asset_dir: str, prefix: str):
-    """將 PDF 每一頁轉成優化後的高清圖片，回傳圖片字典、全頁 Markdown 列表與 API 用的 Part 列表"""
+    """將 PDF 每一頁轉成優化後的高清圖片"""
     os.makedirs(asset_dir, exist_ok=True)
     doc = pymupdf.open(pdf_path)
     page_images = {}
@@ -68,13 +80,11 @@ def render_pdf_pages(pdf_path: str, asset_dir: str, prefix: str):
         page_num = page_idx + 1
         page_images[page_num] = opt_img
 
-        # 儲存給筆記顯示用的 PNG
         page_filename = f"{prefix}_page_{page_num}.png"
         page_save_path = os.path.join(asset_dir, page_filename)
         opt_img.save(page_save_path, "PNG", optimize=True)
         full_page_md_list.append((page_num, f"assets/{page_filename}"))
 
-        # 轉成 JPEG bytes 傳給 Gemini API（體積小、速度快、不會 400 報錯）
         buf = io.BytesIO()
         opt_img.save(buf, format="JPEG", quality=85)
         api_image_parts.append(f"【第 {page_num} 頁板書圖片】：")
@@ -158,14 +168,12 @@ def fix_github_latex(text: str) -> str:
     return text.strip()
 
 def safe_parse_json(raw_text: str) -> dict:
-    """安全解析 JSON，處理可能殘留的 Markdown 標籤或反斜線問題"""
     cleaned = raw_text.strip()
     cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
     cleaned = re.sub(r'\s*```$', '', cleaned)
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
-        # 修復單一反斜線導致的 JSON 解析錯誤
         fixed = re.sub(r'\\(?![/\"\\bfnrtu])', r'\\\\', cleaned)
         return json.loads(fixed)
 
@@ -187,12 +195,21 @@ def call_gemini_with_retry(contents, config, max_retries=5):
                 raise e
 
 def process_latest_pdf():
-    pdf_files = glob.glob("原始檔案/**/*.pdf", recursive=True) + glob.glob("incoming/**/*.pdf", recursive=True)
-    if not pdf_files:
-        print("未在 原始檔案/ 或 incoming/ 找到任何 PDF 檔案。")
+    all_pdfs = glob.glob("原始檔案/**/*.pdf", recursive=True) + glob.glob("incoming/**/*.pdf", recursive=True)
+    
+    # 過濾掉空殼或損壞的 PDF，只保留真正有效的 PDF
+    valid_pdfs = []
+    for p in all_pdfs:
+        if is_valid_pdf(p):
+            valid_pdfs.append(p)
+        else:
+            print(f"⚠️ 略過無效或空白的檔案（請確認是否用 Upload files 上傳）: {p}")
+
+    if not valid_pdfs:
+        print("❌ 未找到任何有效的 PDF 檔案！請使用 Add file -> Upload files 上傳真正的 PDF。")
         return
 
-    latest_pdf = max(pdf_files, key=os.path.getctime)
+    latest_pdf = max(valid_pdfs, key=os.path.getctime)
     pdf_name = os.path.basename(latest_pdf)
     base_name = os.path.splitext(pdf_name)[0]
 
@@ -222,13 +239,11 @@ def process_latest_pdf():
     os.makedirs(asset_dir, exist_ok=True)
     output_md_path = f"{output_dir}/{date_str}_{base_name}.md"
 
-    print(f"正在處理檔案: {latest_pdf} (科目: {subject}, 日期: {date_str})")
+    print(f"✅ 正在處理有效檔案: {latest_pdf} (科目: {subject}, 日期: {date_str})")
 
-    # 1. 先將 PDF 轉為高清優化圖片
     prefix = f"{date_str}_{base_name}"
     page_images, full_pages, api_image_parts = render_pdf_pages(latest_pdf, asset_dir, prefix)
 
-    # 2. 不使用 response_schema，只用純 response_mime_type="application/json" 徹底杜絕 400 錯誤
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
         response_mime_type="application/json",
@@ -251,7 +266,6 @@ def process_latest_pdf():
     diagrams = data.get("diagrams", [])
     question = data.get("question")
 
-    # 3. 執行局部圖表剪貼與替換
     fig_map = crop_diagrams(page_images, asset_dir, prefix, diagrams)
     for placeholder, md_img in fig_map.items():
         if placeholder in notes:
