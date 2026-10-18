@@ -1,2 +1,5 @@
-google-genai>=0.1.1
-PyGithub>=2.1.1
+google-genai
+PyGithub
+pydantic
+pymupdf
+Pillow
