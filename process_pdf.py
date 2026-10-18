@@ -2,7 +2,6 @@ import os
 import re
 import io
 import glob
-import json
 import time
 import pymupdf
 from PIL import Image, ImageEnhance, ImageOps
@@ -20,29 +19,69 @@ if not GEMINI_API_KEY:
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
+# 採用純文字區塊標籤格式，100% 避開 JSON 反斜線跳脫錯誤與 400 Schema 限制
 SYSTEM_PROMPT = """
 你是一位專業的高效學習助理與知識工程師。你的任務是閱讀使用者上傳的課堂板書/講義圖片，將其整理為條理分明、概念嚴謹的 Markdown 筆記。
 
-請嚴格輸出合法的 JSON 格式（不要加任何其他說明文字），結構與欄位如下：
-{
-  "topic": "用 5~12 個字精簡概括這份板書的核心主題（做為檔案名稱與標題用，請勿包含斜線或特殊符號）",
-  "summary": "3~5 個重點的核心精華摘要 (Markdown 格式)",
-  "notes": "完整的結構化筆記。請在需要放入板書原圖表的位置插入 {{FIG_1}}、{{FIG_2}} 標記；若是方塊圖或流程圖，亦可搭配 ```mermaid 語法重繪。",
-  "diagrams": [
-    "頁碼|ymin,xmin,ymax,xmax|圖表標題說明|{{FIG_1}}"
-  ],
-  "question": "如果板書有缺漏、遮蔽、筆跡模糊或邏輯中斷，請提出『一個』最關鍵的具體問題向使用者確認。如果內容完整無缺漏，請填 null。"
-}
+請嚴格依照以下 5 個區塊標籤格式輸出（請務必保留 ===標籤=== 字樣，不要輸出 JSON）：
 
-【圖表剪貼規範】：
-1. 若板書中含有重要的「電路圖、波形圖、相量圖、結構圖」，請在 `diagrams` 陣列中回傳字串，格式嚴格為：`頁碼|ymin,xmin,ymax,xmax|圖表標題|{{FIG_1}}`（頁碼從 1 開始，座標為 0~1000 整數比例），並在 `notes` 內文對應段落插入 `{{FIG_1}}`、`{{FIG_2}}`。若無圖表，`diagrams` 請填 `[]`。
-2. 擷取座標時請稍微留邊距，確保座標軸文字、元件標號（如 $V_s, L_c, i_o$）完整包含在框內。
+===TOPIC===
+用 5~12 個字精簡概括這份板書的核心主題（做為檔案名稱與標題用，請勿包含斜線或特殊符號）
+
+===SUMMARY===
+3~5 個重點的核心精華摘要 (Markdown 格式)
+
+===NOTES===
+完整的結構化筆記 (Markdown 格式)。請在需要放入板書原圖表的位置插入 {{FIG_1}}、{{FIG_2}} 標記；若是方塊圖或流程圖，亦可搭配 ```mermaid 語法重繪。
+
+===DIAGRAMS===
+從板書擷取的關鍵電路圖或波形圖清單，每行一個，格式嚴格為：
+頁碼|ymin,xmin,ymax,xmax|圖表標題說明|{{FIG_1}}
+（例如：1|150,100,550,900|半波整流電路與波形|{{FIG_1}}，座標為 0~1000 整數比例。若無圖表請寫 NONE）
+
+===QUESTION===
+如果板書有缺漏、遮蔽、筆跡模糊或邏輯中斷，請提出『一個』最關鍵的具體問題向使用者確認。如果內容完整無缺漏，請寫 NONE。
 
 【GitHub LaTeX 公式排版嚴格規範（極重要）】：
 1. 行內公式請使用單個錢字號 `$公式$`，獨立區塊公式請使用雙錢字號 `$$公式$$` 並前後空行。
 2. 絕對禁止將 `$公式$` 緊貼半形括號或中文字，外側請務必各留一個半形空白（例如：`（ $0 \\sim t_a$ ）`）。
 3. 區塊公式 `$$` 內部絕對不能有空行，且開頭與結尾的 `$$` 必須獨佔一行。
 """
+
+def parse_tagged_response(text: str) -> dict:
+    """解析 ===標籤=== 格式的回應，完全不受 LaTeX 反斜線影響"""
+    def extract_section(tag_name, next_tags):
+        next_pattern = "|".join([f"==={t}===" for t in next_tags])
+        pattern = rf"==={tag_name}===\s*([\s\S]*?)(?=(?:{next_pattern})|$)"
+        match = re.search(pattern, text)
+        return match.group(1).strip() if match else ""
+
+    topic = extract_section("TOPIC", ["SUMMARY", "NOTES", "DIAGRAMS", "QUESTION"])
+    summary = extract_section("SUMMARY", ["NOTES", "DIAGRAMS", "QUESTION"])
+    notes = extract_section("NOTES", ["DIAGRAMS", "QUESTION"])
+    diagrams_raw = extract_section("DIAGRAMS", ["QUESTION"])
+    question = extract_section("QUESTION", [])
+
+    # 清理 topic 多餘換行
+    topic = topic.splitlines()[0].strip() if topic else "課堂重點整理"
+
+    diagrams = []
+    if diagrams_raw and diagrams_raw.upper() != "NONE":
+        for line in diagrams_raw.splitlines():
+            line = line.strip().lstrip("-* ")
+            if "|" in line and "FIG_" in line:
+                diagrams.append(line)
+
+    if question.upper() in ("NONE", "NULL", ""):
+        question = None
+
+    return {
+        "topic": topic,
+        "summary": summary,
+        "notes": notes,
+        "diagrams": diagrams,
+        "question": question
+    }
 
 def is_valid_pdf(filepath: str) -> bool:
     if not os.path.exists(filepath) or os.path.getsize(filepath) < 100:
@@ -56,10 +95,9 @@ def is_valid_pdf(filepath: str) -> bool:
         return False
 
 def sanitize_filename(name: str) -> str:
-    """清除不能當作檔案名稱的特殊字元（如 / \\ : * ? " < > | 與多餘空白）"""
-    cleaned = re.sub(r'[\\/:*?"<>|\r\n\t]+', '_', name.strip())
+    cleaned = re.sub(r'[\\/:*?"<>|\r\n\t$`]+', '', name.strip())
     cleaned = re.sub(r'\s+', '_', cleaned)
-    return cleaned or "課堂筆記"
+    return cleaned[:40] or "課堂筆記"
 
 def enhance_board_image(pil_img: Image.Image) -> Image.Image:
     img = pil_img.convert("RGB")
@@ -98,13 +136,8 @@ def render_pdf_pages(pdf_path: str, asset_dir: str, prefix: str):
 
 def crop_diagrams(page_images: dict, asset_dir: str, prefix: str, diagrams: list):
     fig_markdown_map = {}
-    if not isinstance(diagrams, list):
-        return fig_markdown_map
-
     for idx, item in enumerate(diagrams, start=1):
         try:
-            if not isinstance(item, str):
-                continue
             parts = [p.strip() for p in item.split("|")]
             if len(parts) < 3:
                 continue
@@ -150,7 +183,7 @@ def crop_diagrams(page_images: dict, asset_dir: str, prefix: str, diagrams: list
 def fix_github_latex(text: str) -> str:
     if not text:
         return ""
-    text = text.replace("\t", "\\t").replace("\b", "\\b").replace("\f", "\\f").replace("\r", "");
+    text = text.replace("\r", "");
 
     def format_block_math(match):
         content = match.group(1).strip()
@@ -168,16 +201,6 @@ def fix_github_latex(text: str) -> str:
     text = re.sub(r'[ ]{2,}', ' ', text);
     text = re.sub(r'\n{3,}', '\n\n', text);
     return text.strip()
-
-def safe_parse_json(raw_text: str) -> dict:
-    cleaned = raw_text.strip()
-    cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
-    cleaned = re.sub(r'\s*```$', '', cleaned)
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        fixed = re.sub(r'\\(?![/\"\\bfnrtu])', r'\\\\', cleaned)
-        return json.loads(fixed)
 
 def call_gemini_with_retry(contents, config, max_retries=5):
     for attempt in range(1, max_retries + 1):
@@ -197,14 +220,11 @@ def call_gemini_with_retry(contents, config, max_retries=5):
                 raise e
 
 def process_latest_pdf():
-    all_pdfs = glob.glob("原始檔案/**/*.pdf", recursive=True) + glob.glob("incoming/**/*.pdf", recursive=True)
+    # 優先搜尋「原始檔案/」下的有效 PDF，若無才找「incoming/」
+    primary_pdfs = [p for p in glob.glob("原始檔案/**/*.pdf", recursive=True) if is_valid_pdf(p)]
+    fallback_pdfs = [p for p in glob.glob("incoming/**/*.pdf", recursive=True) if is_valid_pdf(p)]
     
-    valid_pdfs = []
-    for p in all_pdfs:
-        if is_valid_pdf(p):
-            valid_pdfs.append(p)
-        else:
-            print(f"⚠️ 略過無效或空白的檔案: {p}")
+    valid_pdfs = primary_pdfs if primary_pdfs else fallback_pdfs
 
     if not valid_pdfs:
         print("❌ 未找到任何有效的 PDF 檔案！請使用 Add file -> Upload files 上傳真正的 PDF。")
@@ -241,18 +261,16 @@ def process_latest_pdf():
 
     print(f"✅ 正在處理有效檔案: {latest_pdf} (科目: {subject}, 日期: {date_str})")
 
-    # 圖片檔名前綴使用日期與原檔名雜湊，避免重複
     img_prefix = f"{date_str}_{sanitize_filename(base_name)}"
     page_images, full_pages, api_image_parts = render_pdf_pages(latest_pdf, asset_dir, img_prefix)
 
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
-        response_mime_type="application/json",
     )
 
     prompt_text = (
         f"以上是「{subject}」科目於 {date_str} 的板書/講義（共 {len(page_images)} 頁）。"
-        "請詳細閱讀並依照 JSON 規範產出 topic（精準題目名稱）、summary、notes、diagrams（局部電路/波形圖座標）與 question。"
+        "請詳細閱讀並嚴格依照 ===TOPIC===、===SUMMARY===、===NOTES===、===DIAGRAMS===、===QUESTION=== 五個區塊標籤輸出。"
     )
 
     response = call_gemini_with_retry(
@@ -260,18 +278,18 @@ def process_latest_pdf():
         config=config
     )
 
-    data = safe_parse_json(response.text)
-    topic = data.get("topic", "課堂重點整理").strip()
-    summary = data.get("summary", "")
-    notes = data.get("notes", "")
-    diagrams = data.get("diagrams", [])
-    question = data.get("question")
+    data = parse_tagged_response(response.text)
+    topic = data["topic"]
+    summary = data["summary"]
+    notes = data["notes"]
+    diagrams = data["diagrams"]
+    question = data["question"]
 
-    # 🔥 關鍵修改：使用「日期 + AI 生成的題目 (topic)」作為最終輸出的 Markdown 檔名！
+    # 使用「日期 + AI 生成的題目 (topic)」作為最終輸出的 Markdown 檔名
     safe_topic = sanitize_filename(topic)
     output_md_path = f"{output_dir}/{date_str}_{safe_topic}.md"
 
-    # 若之前有殘留「日期_日期.md」的舊檔，順便自動清理掉，讓資料夾保持乾淨
+    # 自動清理舊的「日期_日期.md」或「日期_原檔名.md」重複檔案
     old_dup_path = f"{output_dir}/{date_str}_{base_name}.md"
     if old_dup_path != output_md_path and os.path.exists(old_dup_path):
         try:
@@ -292,7 +310,7 @@ def process_latest_pdf():
     summary = fix_github_latex(summary)
     notes = fix_github_latex(notes)
     if question:
-        question = fix_github_latex(str(question))
+        question = fix_github_latex(question)
 
     pages_gallery_md = "\n".join([f"#### 📄 第 {p_num} 頁\n![第 {p_num} 頁]({p_path})\n" for p_num, p_path in full_pages])
     gallery_section = (
@@ -327,7 +345,7 @@ def process_latest_pdf():
         f.write(final_content)
     print(f"✅ 筆記與優化圖片已成功寫入 {output_md_path}")
 
-    if question and str(question).strip().lower() not in ("null", "none", ""):
+    if question:
         try:
             auth = Auth.Token(GITHUB_TOKEN)
             gh = Github(auth=auth)
