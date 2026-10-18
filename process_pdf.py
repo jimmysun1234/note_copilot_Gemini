@@ -19,7 +19,6 @@ if not GEMINI_API_KEY:
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# 採用純文字區塊標籤格式，100% 避開 JSON 反斜線跳脫錯誤與 400 Schema 限制
 SYSTEM_PROMPT = """
 你是一位專業的高效學習助理與知識工程師。你的任務是閱讀使用者上傳的課堂板書/講義圖片，將其整理為條理分明、概念嚴謹的 Markdown 筆記。
 
@@ -49,7 +48,6 @@ SYSTEM_PROMPT = """
 """
 
 def parse_tagged_response(text: str) -> dict:
-    """解析 ===標籤=== 格式的回應，完全不受 LaTeX 反斜線影響"""
     def extract_section(tag_name, next_tags):
         next_pattern = "|".join([f"==={t}===" for t in next_tags])
         pattern = rf"==={tag_name}===\s*([\s\S]*?)(?=(?:{next_pattern})|$)"
@@ -62,7 +60,6 @@ def parse_tagged_response(text: str) -> dict:
     diagrams_raw = extract_section("DIAGRAMS", ["QUESTION"])
     question = extract_section("QUESTION", [])
 
-    # 清理 topic 多餘換行
     topic = topic.splitlines()[0].strip() if topic else "課堂重點整理"
 
     diagrams = []
@@ -219,23 +216,28 @@ def call_gemini_with_retry(contents, config, max_retries=5):
             else:
                 raise e
 
-def process_latest_pdf():
-    # 優先搜尋「原始檔案/」下的有效 PDF，若無才找「incoming/」
-    primary_pdfs = [p for p in glob.glob("原始檔案/**/*.pdf", recursive=True) if is_valid_pdf(p)]
-    fallback_pdfs = [p for p in glob.glob("incoming/**/*.pdf", recursive=True) if is_valid_pdf(p)]
-    
-    valid_pdfs = primary_pdfs if primary_pdfs else fallback_pdfs
+def is_pdf_already_processed(pdf_path: str, output_dir: str, date_str: str) -> bool:
+    """檢查該 PDF 是否已經在對應科目資料夾中生成過筆記"""
+    if not os.path.exists(output_dir):
+        return False
+    existing_mds = glob.glob(f"{output_dir}/*.md")
+    for md_file in existing_mds:
+        # 1. 檢查筆記內文是否記錄了該原始檔案路徑
+        try:
+            with open(md_file, "r", encoding="utf-8") as f:
+                head_text = f.read(500)
+                if f"`{pdf_path}`" in head_text:
+                    return True
+        except Exception:
+            pass
+    return False
 
-    if not valid_pdfs:
-        print("❌ 未找到任何有效的 PDF 檔案！請使用 Add file -> Upload files 上傳真正的 PDF。")
-        return
-
-    latest_pdf = max(valid_pdfs, key=os.path.getctime)
-    pdf_name = os.path.basename(latest_pdf)
+def process_single_pdf(target_pdf: str):
+    pdf_name = os.path.basename(target_pdf)
     base_name = os.path.splitext(pdf_name)[0]
 
-    root_folder = "原始檔案" if latest_pdf.startswith("原始檔案") else "incoming"
-    rel_dir = os.path.dirname(os.path.relpath(latest_pdf, root_folder))
+    root_folder = "原始檔案" if target_pdf.startswith("原始檔案") else "incoming"
+    rel_dir = os.path.dirname(os.path.relpath(target_pdf, root_folder))
     if rel_dir and rel_dir != ".":
         subject = rel_dir.split(os.sep)[0]
     elif "_" in base_name:
@@ -243,7 +245,7 @@ def process_latest_pdf():
     else:
         subject = "一般科目"
 
-    date_match = re.search(r'20\d{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])', latest_pdf)
+    date_match = re.search(r'20\d{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])', target_pdf)
     if date_match:
         date_str = date_match.group(0)
         target_date = datetime.strptime(date_str, "%Y-%m-%d")
@@ -259,10 +261,10 @@ def process_latest_pdf():
     asset_dir = f"{output_dir}/assets"
     os.makedirs(asset_dir, exist_ok=True)
 
-    print(f"✅ 正在處理有效檔案: {latest_pdf} (科目: {subject}, 日期: {date_str})")
+    print(f"🚀 開始處理檔案: {target_pdf} (科目: {subject}, 日期: {date_str})")
 
     img_prefix = f"{date_str}_{sanitize_filename(base_name)}"
-    page_images, full_pages, api_image_parts = render_pdf_pages(latest_pdf, asset_dir, img_prefix)
+    page_images, full_pages, api_image_parts = render_pdf_pages(target_pdf, asset_dir, img_prefix)
 
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
@@ -285,18 +287,8 @@ def process_latest_pdf():
     diagrams = data["diagrams"]
     question = data["question"]
 
-    # 使用「日期 + AI 生成的題目 (topic)」作為最終輸出的 Markdown 檔名
     safe_topic = sanitize_filename(topic)
     output_md_path = f"{output_dir}/{date_str}_{safe_topic}.md"
-
-    # 自動清理舊的「日期_日期.md」或「日期_原檔名.md」重複檔案
-    old_dup_path = f"{output_dir}/{date_str}_{base_name}.md"
-    if old_dup_path != output_md_path and os.path.exists(old_dup_path):
-        try:
-            os.remove(old_dup_path)
-            print(f"🧹 已自動清理舊檔名檔案: {old_dup_path}")
-        except Exception:
-            pass
 
     fig_map = crop_diagrams(page_images, asset_dir, img_prefix, diagrams)
     for placeholder, md_img in fig_map.items():
@@ -331,7 +323,7 @@ def process_latest_pdf():
 
     final_content = (
         f"{header_title}\n"
-        f"> **科目**：`{subject}` ｜ **上課日期**：`{date_str}` ｜ **原始檔案**：`{latest_pdf}`\n\n"
+        f"> **科目**：`{subject}` ｜ **上課日期**：`{date_str}` ｜ **原始檔案**：`{target_pdf}`\n\n"
         f"## 📌 3 分鐘核心摘要\n{summary}\n\n"
         f"---\n\n"
         f"## 📖 結構化重點筆記（含自動剪貼圖表）\n{notes}\n\n"
@@ -353,7 +345,7 @@ def process_latest_pdf():
             issue_title = f"【{subject}｜筆記待補全】{date_str} {topic}"
             issue_body = (
                 "### AI 學習助理提問\n"
-                f"在閱讀 `{latest_pdf}` 時發現部分內容需釐清：\n\n"
+                f"在閱讀 `{target_pdf}` 時發現部分內容需釐清：\n\n"
                 f"> **{question}**\n\n"
                 "---\n"
                 f"💡 **回覆說明**：直接在此 Issue 留言回答，補全資訊將會在後續整合至 `{output_md_path}`。\n"
@@ -363,5 +355,38 @@ def process_latest_pdf():
         except Exception as e:
             print(f"⚠️ 建立 Issue 時發生警告（不影響筆記儲存）: {e}")
 
+def process_all_unprocessed_pdfs():
+    primary_pdfs = sorted([p for p in glob.glob("原始檔案/**/*.pdf", recursive=True) if is_valid_pdf(p)])
+    fallback_pdfs = sorted([p for p in glob.glob("incoming/**/*.pdf", recursive=True) if is_valid_pdf(p)])
+    valid_pdfs = primary_pdfs if primary_pdfs else fallback_pdfs
+
+    if not valid_pdfs:
+        print("❌ 未找到任何有效的 PDF 檔案！")
+        return
+
+    processed_count = 0
+    for pdf_path in valid_pdfs:
+        pdf_name = os.path.basename(pdf_path)
+        base_name = os.path.splitext(pdf_name)[0]
+        root_folder = "原始檔案" if pdf_path.startswith("原始檔案") else "incoming"
+        rel_dir = os.path.dirname(os.path.relpath(pdf_path, root_folder))
+        subject = rel_dir.split(os.sep)[0] if (rel_dir and rel_dir != ".") else (base_name.split("_")[0] if "_" in base_name else "一般科目")
+        
+        date_match = re.search(r'20\d{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])', pdf_path)
+        date_str = date_match.group(0) if date_match else ""
+        output_dir = f"notes/{subject}"
+
+        if is_pdf_already_processed(pdf_path, output_dir, date_str):
+            print(f"⏭️ 已存在對應筆記，自動略過: {pdf_path}")
+            continue
+
+        process_single_pdf(pdf_path)
+        processed_count += 1
+
+    # 如果所有檔案都處理過了（例如你手動按 Run workflow 想重跑最新一份），才強制重跑最後一份
+    if processed_count == 0:
+        print("ℹ️ 所有 PDF 皆已生成過筆記，將重新處理清單中的第一份檔案...")
+        process_single_pdf(valid_pdfs[0])
+
 if __name__ == "__main__":
-    process_latest_pdf()
+    process_all_unprocessed_pdfs()
