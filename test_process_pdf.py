@@ -57,19 +57,28 @@ class PdfQueueTest(unittest.TestCase):
 
 
 class GeminiRetryTest(unittest.TestCase):
-    def assert_attempts(self, http_status, expected_attempts):
+    def assert_attempts(self, statuses, expected_models):
         attempts = []
+        responses = iter(statuses)
+        fake_note = (
+            "===TOPIC===測試標題\n===SUMMARY===測試摘要\n"
+            "===NOTES===測試正文\n===DIAGRAMS===NONE\n===QUESTION===NONE"
+        )
 
         def respond(request):
-            attempts.append(request.method)
+            attempts.append(request.url.path.rsplit("/", 1)[-1].split(":", 1)[0])
+            code = next(responses)
+            if code == 200:
+                return http.Response(
+                    code,
+                    json={"candidates": [{
+                        "content": {"role": "model", "parts": [{"text": fake_note}]},
+                        "finishReason": "STOP",
+                    }]},
+                )
             return http.Response(
-                http_status,
-                json={
-                    "error": {
-                        "code": http_status,
-                        "message": "test response",
-                    }
-                },
+                code,
+                json={"error": {"code": code, "message": "test response"}},
             )
 
         sdk_client = process_pdf.genai.Client
@@ -80,24 +89,46 @@ class GeminiRetryTest(unittest.TestCase):
             )
             return sdk_client(**kwargs)
 
+        def generate():
+            return process_pdf.call_gemini_with_retry(
+                ["synthetic input"], process_pdf.types.GenerateContentConfig()
+            )
+
         with (
             patch.dict(os.environ, {"GEMINI_API_KEY": "unused-test-key"}),
             patch.object(process_pdf.genai, "Client", side_effect=create_client),
             patch("tenacity.nap.time.sleep"),
-            self.assertRaises(process_pdf.errors.APIError) as raised,
         ):
-            process_pdf.call_gemini_with_retry(
-                ["synthetic input"], process_pdf.types.GenerateContentConfig()
-            )
+            if statuses[-1] == 200:
+                self.assertEqual(process_pdf.parse_tagged_response(generate().text)["notes"], "測試正文")
+            else:
+                with self.assertRaises(process_pdf.errors.APIError) as raised:
+                    generate()
+                self.assertEqual(raised.exception.code, statuses[-1])
 
-        self.assertEqual(raised.exception.code, http_status)
-        self.assertEqual(attempts, ["POST"] * expected_attempts)
+        self.assertEqual(attempts, expected_models)
 
     def test_503_has_three_total_http_attempts(self):
-        self.assert_attempts(503, 3)
+        self.assert_attempts(
+            [503, 503, 503],
+            ["gemini-3.8-flash", "gemini-3.8-flash", "gemini-3.5-flash-lite"],
+        )
+
+    def test_alternate_model_can_generate_the_note(self):
+        self.assert_attempts(
+            [503, 503, 200],
+            ["gemini-3.8-flash", "gemini-3.8-flash", "gemini-3.5-flash-lite"],
+        )
+
+    def test_primary_success_does_not_call_the_alternate_model(self):
+        self.assert_attempts([200], ["gemini-3.8-flash"])
 
     def test_429_is_not_retried(self):
-        self.assert_attempts(429, 1)
+        self.assert_attempts([429], ["gemini-3.8-flash"])
+
+    def test_incomplete_model_response_does_not_become_a_note(self):
+        with self.assertRaisesRegex(ValueError, "缺少標題、摘要或正文"):
+            process_pdf.parse_tagged_response("===TOPIC===只有標題")
 
 
 if __name__ == "__main__":

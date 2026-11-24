@@ -55,7 +55,10 @@ def parse_tagged_response(text: str) -> dict:
     diagrams_raw = extract_section("DIAGRAMS", ["QUESTION"])
     question = extract_section("QUESTION", [])
 
-    topic = topic.splitlines()[0].strip() if topic else "課堂重點整理"
+    if not topic or not summary or not notes:
+        raise ValueError("Gemini 回覆缺少標題、摘要或正文，未建立筆記。")
+
+    topic = topic.splitlines()[0].strip()
 
     diagrams = []
     if diagrams_raw and diagrams_raw.upper() != "NONE":
@@ -199,25 +202,35 @@ def call_gemini_with_retry(contents, config):
     if not api_key:
         raise ValueError("GEMINI_API_KEY 未設定，請檢查 Secrets。")
 
-    # Keep a single retry budget. HTTP 429 can indicate an exhausted daily
-    # quota, so let a future run handle it instead of retrying in this job.
-    http_options = types.HttpOptions(
-        timeout=120_000,
-        retry_options=types.HttpRetryOptions(
-            attempts=3,
-            initial_delay=2,
-            max_delay=10,
-            exp_base=2,
-            jitter=1,
-            http_status_codes=[408, 500, 502, 503, 504],
-        ),
-    )
-    with genai.Client(api_key=api_key, http_options=http_options) as client:
-        return client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=contents,
-            config=config,
+    def generate(model, attempts):
+        http_options = types.HttpOptions(
+            timeout=120_000,
+            retry_options=types.HttpRetryOptions(
+                attempts=attempts,
+                initial_delay=2,
+                max_delay=10,
+                exp_base=2,
+                jitter=1,
+                http_status_codes=[408, 500, 502, 503, 504],
+            ),
         )
+        with genai.Client(api_key=api_key, http_options=http_options) as client:
+            return client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config,
+            )
+
+    # Two primary attempts plus at most one alternate attempt. Do not switch
+    # models on quota, authentication or invalid-request errors.
+    try:
+        return generate("gemini-3.8-flash", attempts=2)
+    except errors.APIError as error:
+        if error.code != 503:
+            raise
+
+    print("⚠️ Gemini 3.8 Flash 暫時無法使用（HTTP 503），試一次 Gemini 3.5 Flash-Lite。")
+    return generate("gemini-3.5-flash-lite", attempts=1)
 
 
 def is_pdf_already_processed(pdf_path: str, output_dir: str) -> bool:
