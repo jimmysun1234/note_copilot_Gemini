@@ -55,7 +55,10 @@ SYSTEM_PROMPT = """
 3. 區塊公式 `$$` 內部絕對不能有空行，且開頭與結尾的 `$$` 必須獨佔一行。
 """
 
-def parse_tagged_response(text: str) -> dict:
+def parse_tagged_response(text: str, default_topic: str = "課堂重點筆記") -> dict:
+    if not text or not text.strip():
+        raise ValueError("Gemini 回傳空內容，未建立筆記。")
+
     def extract_section(tag_name, next_tags):
         next_pattern = "|".join([f"==={t}===" for t in next_tags])
         pattern = rf"==={tag_name}===\s*([\s\S]*?)(?=(?:{next_pattern})|$)"
@@ -68,10 +71,26 @@ def parse_tagged_response(text: str) -> dict:
     diagrams_raw = extract_section("DIAGRAMS", ["QUESTION"])
     question = extract_section("QUESTION", [])
 
-    if not topic or not summary or not notes:
-        raise ValueError("Gemini 回覆缺少標題、摘要或正文，未建立筆記。")
+    # 寬容解析：若備援模型漏寫標籤直接輸出 Markdown，自動提取標題與正文，不浪費已生成的內容
+    if not notes:
+        print("⚠️ 模型未完整遵循 ===TAG=== 標籤，啟用自動 Markdown 結構萃取...")
+        clean_text = re.sub(r'===(?:TOPIC|SUMMARY|NOTES|DIAGRAMS|QUESTION)===', '', text).strip()
+        lines = [line.strip() for line in clean_text.splitlines() if line.strip()]
+        if not lines:
+            raise ValueError("Gemini 回覆無法解析出有效正文。")
+        if not topic:
+            first_heading = re.sub(r'^#+\s*', '', lines[0])
+            topic = first_heading[:30] or default_topic
+        if not summary:
+            summary = "- 本篇筆記由板書自動整理，包含完整電路模態分析、公式推導與波形解析。"
+        notes = clean_text
 
-    topic = topic.splitlines()[0].strip()
+    if not topic:
+        topic = default_topic
+    topic = topic.splitlines()[0].strip().lstrip("# ")
+
+    if not summary:
+        summary = "- 本篇筆記由板書自動整理，詳細推導與圖表請見下方內文。"
 
     diagrams = []
     if diagrams_raw and diagrams_raw.upper() != "NONE":
@@ -123,8 +142,7 @@ def render_pdf_pages(pdf_path: str, asset_dir: str, prefix: str):
 
     for page_idx in range(len(doc)):
         page = doc[page_idx]
-        # 提升渲染解析度至 2.5x，讓手寫公式下標（如 D1, D2, K_crit）更清晰
-        pix = page.get_pixmap(matrix=pymupdf.Matrix(2.5, 2.5), alpha=False)
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(2.2, 2.2), alpha=False)
         pil_img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
         opt_img = enhance_board_image(pil_img)
         page_num = page_idx + 1
@@ -136,7 +154,7 @@ def render_pdf_pages(pdf_path: str, asset_dir: str, prefix: str):
         full_page_md_list.append((page_num, f"assets/{page_filename}"))
 
         buf = io.BytesIO()
-        opt_img.save(buf, format="JPEG", quality=88)
+        opt_img.save(buf, format="JPEG", quality=85)
         api_image_parts.append(f"【第 {page_num} 頁板書圖片】：")
         api_image_parts.append(types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"))
 
@@ -221,10 +239,10 @@ def call_gemini_with_retry(contents, config):
             timeout=180_000,
             retry_options=types.HttpRetryOptions(
                 attempts=attempts,
-                initial_delay=5,
-                max_delay=30,
+                initial_delay=15,
+                max_delay=60,
                 exp_base=2,
-                jitter=2,
+                jitter=3,
                 http_status_codes=[408, 429, 500, 502, 503, 504],
             ),
         )
@@ -235,10 +253,10 @@ def call_gemini_with_retry(contents, config):
                 config=config,
             )
 
-    # 依序嘗試主力模型與穩定備援模型，平滑度過 503 尖峰
+    # 控制重試次數避免自己觸發 429 頻率限制
     fallback_chain = [
-        ("gemini-3.8-flash", 5),
-        ("gemini-3.5-flash-lite", 3),
+        ("gemini-3.8-flash", 2),
+        ("gemini-3.5-flash-lite", 2),
     ]
 
     last_error = None
@@ -305,7 +323,7 @@ def process_single_pdf(target_pdf: str):
 
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
-        max_output_tokens=16384,
+        max_output_tokens=12288,
         temperature=0.2,
     )
 
@@ -313,7 +331,7 @@ def process_single_pdf(target_pdf: str):
         f"以上是「{subject}」科目於 {date_str} 的板書/講義（共 {len(page_images)} 頁）。\n"
         "請仔細辨識圖片中的所有手寫公式、下標符號與波形圖，並補全所有省略的代數推導步驟、"
         "物理意義解說與比較表格，撰寫成一份詳盡的教科書級複習筆記。\n"
-        "請嚴格依照 ===TOPIC===、===SUMMARY===、===NOTES===、===DIAGRAMS===、===QUESTION=== 五個區塊標籤輸出。"
+        "【重要提醒】請務必以 ===TOPIC===、===SUMMARY===、===NOTES===、===DIAGRAMS===、===QUESTION=== 五個區塊標籤作為段落開頭輸出！"
     )
 
     response = call_gemini_with_retry(
@@ -321,7 +339,11 @@ def process_single_pdf(target_pdf: str):
         config=config
     )
 
-    data = parse_tagged_response(response.text)
+    raw_text = response.text or ""
+    if not raw_text.strip():
+        print(f"⚠️ API 回傳空白，完整回應物件：{response}")
+
+    data = parse_tagged_response(raw_text, default_topic=f"{subject}_{date_str}_筆記")
     topic = data["topic"]
     summary = data["summary"]
     notes = data["notes"]
