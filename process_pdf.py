@@ -237,9 +237,8 @@ def call_gemini_with_retry(contents, config):
 
     # 依序嘗試主力模型與穩定備援模型，平滑度過 503 尖峰
     fallback_chain = [
-        ("gemini-3.8-flash", 3),
-        ("gemini-2.5-flash", 3),
-        ("gemini-3.5-flash-lite", 2),
+        ("gemini-3.8-flash", 5),
+        ("gemini-3.5-flash-lite", 3),
     ]
 
     last_error = None
