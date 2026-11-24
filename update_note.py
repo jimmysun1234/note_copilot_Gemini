@@ -110,9 +110,8 @@ def call_gemini_with_retry(contents, config):
             )
 
     fallback_chain = [
-        ("gemini-3.8-flash", 3),
-        ("gemini-2.5-flash", 3),
-        ("gemini-3.5-flash-lite", 2),
+        ("gemini-3.8-flash", 5),
+        ("gemini-3.5-flash-lite", 3),
     ]
 
     last_error = None
