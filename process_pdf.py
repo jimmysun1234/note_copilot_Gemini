@@ -136,7 +136,7 @@ def render_pdf_pages(pdf_path: str, asset_dir: str, prefix: str):
         full_page_md_list.append((page_num, f"assets/{page_filename}"))
 
         buf = io.BytesIO()
-        opt_img.save(buf, format="JPEG", quality=92)
+        opt_img.save(buf, format="JPEG", quality=88)
         api_image_parts.append(f"【第 {page_num} 頁板書圖片】：")
         api_image_parts.append(types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"))
 
@@ -218,14 +218,14 @@ def call_gemini_with_retry(contents, config):
 
     def generate(model, attempts):
         http_options = types.HttpOptions(
-            timeout=180_000,  # 延長超時至 180 秒，確保長篇推導不會中斷
+            timeout=180_000,
             retry_options=types.HttpRetryOptions(
                 attempts=attempts,
-                initial_delay=2,
-                max_delay=10,
+                initial_delay=5,
+                max_delay=30,
                 exp_base=2,
-                jitter=1,
-                http_status_codes=[408, 500, 502, 503, 504],
+                jitter=2,
+                http_status_codes=[408, 429, 500, 502, 503, 504],
             ),
         )
         with genai.Client(api_key=api_key, http_options=http_options) as client:
@@ -235,14 +235,26 @@ def call_gemini_with_retry(contents, config):
                 config=config,
             )
 
-    try:
-        return generate("gemini-3.8-flash", attempts=2)
-    except errors.APIError as error:
-        if error.code != 503:
-            raise
+    # 依序嘗試主力模型與穩定備援模型，平滑度過 503 尖峰
+    fallback_chain = [
+        ("gemini-3.8-flash", 3),
+        ("gemini-2.5-flash", 3),
+        ("gemini-3.5-flash-lite", 2),
+    ]
 
-    print("⚠️ Gemini 3.8 Flash 暫時無法使用（HTTP 503），試一次 Gemini 3.5 Flash-Lite。")
-    return generate("gemini-3.5-flash-lite", attempts=1)
+    last_error = None
+    for idx, (model_name, attempts) in enumerate(fallback_chain):
+        try:
+            if idx > 0:
+                print(f"🔄 切換備援模型嘗試：{model_name}...")
+            return generate(model_name, attempts=attempts)
+        except errors.APIError as error:
+            last_error = error
+            if error.code not in (429, 500, 502, 503, 504):
+                raise
+            print(f"⚠️ {model_name} 暫時無法使用（HTTP {error.code}）...")
+
+    raise last_error
 
 
 def is_pdf_already_processed(pdf_path: str, output_dir: str) -> bool:
@@ -292,7 +304,6 @@ def process_single_pdf(target_pdf: str):
     img_prefix = f"{date_str}_{sanitize_filename(base_name)}"
     page_images, full_pages, api_image_parts = render_pdf_pages(target_pdf, asset_dir, img_prefix)
 
-    # 關鍵升級：提高 max_output_tokens 並調低 temperature 確保推導嚴謹完整
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
         max_output_tokens=16384,
