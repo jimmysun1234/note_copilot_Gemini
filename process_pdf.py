@@ -2,22 +2,17 @@ import os
 import re
 import io
 import glob
-import time
+import hashlib
 import pymupdf
 from PIL import Image, ImageEnhance, ImageOps
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 from github import Github, Auth
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 REPO_NAME = os.getenv("GITHUB_REPOSITORY")
-
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY 未設定，請檢查 Secrets。")
-
-client = genai.Client(api_key=GEMINI_API_KEY)
 
 SYSTEM_PROMPT = """
 你是一位專業的高效學習助理與知識工程師。你的任務是閱讀使用者上傳的課堂板書/講義圖片，將其整理為條理分明、概念嚴謹的 Markdown 筆記。
@@ -199,24 +194,33 @@ def fix_github_latex(text: str) -> str:
     text = re.sub(r'\n{3,}', '\n\n', text);
     return text.strip()
 
-def call_gemini_with_retry(contents, config, max_retries=5):
-    for attempt in range(1, max_retries + 1):
-        try:
-            return client.models.generate_content(
-                model="gemini-3.8-flash",
-                contents=contents,
-                config=config
-            )
-        except Exception as e:
-            err_msg = str(e)
-            if ("503" in err_msg or "429" in err_msg or "UNAVAILABLE" in err_msg) and attempt < max_retries:
-                wait_sec = attempt * 10
-                print(f"⚠️ Google 伺服器忙碌中 (第 {attempt}/{max_retries} 次嘗試)，等待 {wait_sec} 秒後重試...")
-                time.sleep(wait_sec)
-            else:
-                raise e
+def call_gemini_with_retry(contents, config):
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY 未設定，請檢查 Secrets。")
 
-def is_pdf_already_processed(pdf_path: str, output_dir: str, date_str: str) -> bool:
+    # Keep a single retry budget. HTTP 429 can indicate an exhausted daily
+    # quota, so let a future run handle it instead of retrying in this job.
+    http_options = types.HttpOptions(
+        timeout=120_000,
+        retry_options=types.HttpRetryOptions(
+            attempts=3,
+            initial_delay=2,
+            max_delay=10,
+            exp_base=2,
+            jitter=1,
+            http_status_codes=[408, 500, 502, 503, 504],
+        ),
+    )
+    with genai.Client(api_key=api_key, http_options=http_options) as client:
+        return client.models.generate_content(
+            model="gemini-3.8-flash",
+            contents=contents,
+            config=config,
+        )
+
+
+def is_pdf_already_processed(pdf_path: str, output_dir: str) -> bool:
     """檢查該 PDF 是否已經在對應科目資料夾中生成過筆記"""
     if not os.path.exists(output_dir):
         return False
@@ -226,24 +230,22 @@ def is_pdf_already_processed(pdf_path: str, output_dir: str, date_str: str) -> b
         try:
             with open(md_file, "r", encoding="utf-8") as f:
                 head_text = f.read(500)
-                if f"`{pdf_path}`" in head_text:
+                if any(f"`{value}`" in head_text for value in {pdf_path, Path(pdf_path).as_posix()}):
                     return True
         except Exception:
             pass
     return False
 
-def process_single_pdf(target_pdf: str):
-    pdf_name = os.path.basename(target_pdf)
-    base_name = os.path.splitext(pdf_name)[0]
+def pdf_subject(pdf_path: str) -> str:
+    path = Path(pdf_path)
+    if len(path.parts) > 2:
+        return path.parts[1]
+    return path.stem.split("_", 1)[0] if "_" in path.stem else "一般科目"
 
-    root_folder = "原始檔案" if target_pdf.startswith("原始檔案") else "incoming"
-    rel_dir = os.path.dirname(os.path.relpath(target_pdf, root_folder))
-    if rel_dir and rel_dir != ".":
-        subject = rel_dir.split(os.sep)[0]
-    elif "_" in base_name:
-        subject = base_name.split("_")[0]
-    else:
-        subject = "一般科目"
+
+def process_single_pdf(target_pdf: str):
+    base_name = Path(target_pdf).stem
+    subject = pdf_subject(target_pdf)
 
     date_match = re.search(r'20\d{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])', target_pdf)
     if date_match:
@@ -323,7 +325,7 @@ def process_single_pdf(target_pdf: str):
 
     final_content = (
         f"{header_title}\n"
-        f"> **科目**：`{subject}` ｜ **上課日期**：`{date_str}` ｜ **原始檔案**：`{target_pdf}`\n\n"
+        f"> **科目**：`{subject}` ｜ **上課日期**：`{date_str}` ｜ **原始檔案**：`{Path(target_pdf).as_posix()}`\n\n"
         f"## 📌 3 分鐘核心摘要\n{summary}\n\n"
         f"---\n\n"
         f"## 📖 結構化重點筆記（含自動剪貼圖表）\n{notes}\n\n"
@@ -345,7 +347,7 @@ def process_single_pdf(target_pdf: str):
             issue_title = f"【{subject}｜筆記待補全】{date_str} {topic}"
             issue_body = (
                 "### AI 學習助理提問\n"
-                f"在閱讀 `{target_pdf}` 時發現部分內容需釐清：\n\n"
+                f"在閱讀 `{Path(target_pdf).as_posix()}` 時發現部分內容需釐清：\n\n"
                 f"> **{question}**\n\n"
                 "---\n"
                 f"💡 **回覆說明**：直接在此 Issue 留言回答，補全資訊將會在後續整合至 `{output_md_path}`。\n"
@@ -356,37 +358,50 @@ def process_single_pdf(target_pdf: str):
             print(f"⚠️ 建立 Issue 時發生警告（不影響筆記儲存）: {e}")
 
 def process_all_unprocessed_pdfs():
-    primary_pdfs = sorted([p for p in glob.glob("原始檔案/**/*.pdf", recursive=True) if is_valid_pdf(p)])
-    fallback_pdfs = sorted([p for p in glob.glob("incoming/**/*.pdf", recursive=True) if is_valid_pdf(p)])
-    valid_pdfs = primary_pdfs if primary_pdfs else fallback_pdfs
-
-    if not valid_pdfs:
-        print("❌ 未找到任何有效的 PDF 檔案！")
+    paths = [
+        path
+        for root in ("原始檔案", "incoming")
+        for path in sorted(glob.glob(f"{root}/**/*.pdf", recursive=True))
+        if is_valid_pdf(path)
+    ]
+    if not paths:
+        print("ℹ️ 未找到任何有效的 PDF 檔案。")
         return
 
-    processed_count = 0
-    for pdf_path in valid_pdfs:
-        pdf_name = os.path.basename(pdf_path)
-        base_name = os.path.splitext(pdf_name)[0]
-        root_folder = "原始檔案" if pdf_path.startswith("原始檔案") else "incoming"
-        rel_dir = os.path.dirname(os.path.relpath(pdf_path, root_folder))
-        subject = rel_dir.split(os.sep)[0] if (rel_dir and rel_dir != ".") else (base_name.split("_")[0] if "_" in base_name else "一般科目")
-        
-        date_match = re.search(r'20\d{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])', pdf_path)
-        date_str = date_match.group(0) if date_match else ""
-        output_dir = f"notes/{subject}"
+    groups = {}
+    for pdf_path in paths:
+        subject = pdf_subject(pdf_path)
+        with open(pdf_path, "rb") as pdf_file:
+            digest = hashlib.file_digest(pdf_file, "sha256").digest()
+        groups.setdefault((subject, digest), []).append(pdf_path)
 
-        if is_pdf_already_processed(pdf_path, output_dir, date_str):
-            print(f"⏭️ 已存在對應筆記，自動略過: {pdf_path}")
+    processed_count = 0
+    for (subject, _), copies in groups.items():
+        output_dir = f"notes/{subject}"
+        if any(is_pdf_already_processed(path, output_dir) for path in copies):
+            print(f"⏭️ 已存在對應筆記，自動略過: {copies[0]}")
             continue
 
-        process_single_pdf(pdf_path)
+        process_single_pdf(copies[0])
         processed_count += 1
 
-    # 如果所有檔案都處理過了（例如你手動按 Run workflow 想重跑最新一份），才強制重跑最後一份
     if processed_count == 0:
-        print("ℹ️ 所有 PDF 皆已生成過筆記，將重新處理清單中的第一份檔案...")
-        process_single_pdf(valid_pdfs[0])
+        print("ℹ️ 沒有待處理的 PDF，已保留現有筆記。")
+
+
+def main():
+    try:
+        process_all_unprocessed_pdfs()
+    except errors.APIError as error:
+        if error.code == 429:
+            print("❌ Gemini 暫時超過請求限制或額度。未完成的 PDF 留待下次執行。")
+        elif error.code in (408, 500, 502, 503, 504):
+            print(f"❌ Gemini 暫時無法完成請求（HTTP {error.code}）。未完成的 PDF 留待下次執行。")
+        else:
+            raise
+        return 1
+    return 0
+
 
 if __name__ == "__main__":
-    process_all_unprocessed_pdfs()
+    raise SystemExit(main())
