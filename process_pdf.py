@@ -1,6 +1,7 @@
 import os
 import re
 import io
+import time
 import glob
 import hashlib
 import pymupdf
@@ -16,7 +17,7 @@ REPO_NAME = os.getenv("GITHUB_REPOSITORY")
 
 SYSTEM_PROMPT = """
 你是一位專精於「工程與理工科目（特別是電力電子、控制系統、電路學）」的大學助教與知識工程師。
-你的任務是將使用者上傳的課堂板書/講義圖片，整理成一份**極度詳盡、完整保留數學推導與物理直覺的教科書級 Markdown 筆記**（目標長度至少 1500～3000 字，絕不偷工減料）。
+你的任務是將使用者上傳的課堂板書/講義圖片，整理成一份**詳盡、完整保留數學推導與物理直覺的教科書級 Markdown 筆記**（目標長度約 1500～2500 字，絕不偷工減料）。
 
 【核心寫作鐵則（務必嚴格遵守）】
 1. **禁止大綱式跳躍**：嚴禁只寫「經由伏秒平衡可得某式」或「整理得二次方程式」這類跳過過程的摘要！凡是板書上出現的公式推導，你必須補齊**所有中間代數化簡步驟**（Step 1, Step 2, Step 3...），並說明每一步使用的物理定律（如 KVL、KCL、電感伏秒平衡、電容安培秒平衡、三角形面積法求平均電流等）。
@@ -71,7 +72,6 @@ def parse_tagged_response(text: str, default_topic: str = "課堂重點筆記") 
     diagrams_raw = extract_section("DIAGRAMS", ["QUESTION"])
     question = extract_section("QUESTION", [])
 
-    # 寬容解析：若備援模型漏寫標籤直接輸出 Markdown，自動提取標題與正文，不浪費已生成的內容
     if not notes:
         print("⚠️ 模型未完整遵循 ===TAG=== 標籤，啟用自動 Markdown 結構萃取...")
         clean_text = re.sub(r'===(?:TOPIC|SUMMARY|NOTES|DIAGRAMS|QUESTION)===', '', text).strip()
@@ -142,19 +142,23 @@ def render_pdf_pages(pdf_path: str, asset_dir: str, prefix: str):
 
     for page_idx in range(len(doc)):
         page = doc[page_idx]
-        pix = page.get_pixmap(matrix=pymupdf.Matrix(2.2, 2.2), alpha=False)
-        pil_img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        opt_img = enhance_board_image(pil_img)
+        # 存檔用高畫質 (2.0x)
+        pix_hd = page.get_pixmap(matrix=pymupdf.Matrix(2.0, 2.0), alpha=False)
+        pil_img_hd = Image.frombytes("RGB", [pix_hd.width, pix_hd.height], pix_hd.samples)
+        opt_img_hd = enhance_board_image(pil_img_hd)
         page_num = page_idx + 1
-        page_images[page_num] = opt_img
+        page_images[page_num] = opt_img_hd
 
         page_filename = f"{prefix}_page_{page_num}.png"
         page_save_path = os.path.join(asset_dir, page_filename)
-        opt_img.save(page_save_path, "PNG", optimize=True)
+        opt_img_hd.save(page_save_path, "PNG", optimize=True)
         full_page_md_list.append((page_num, f"assets/{page_filename}"))
 
+        # 傳給 API 用輕量化尺寸 (1.5x, JPEG 80)，大幅降低 Input Token 避免觸發 429 限制
+        pix_api = page.get_pixmap(matrix=pymupdf.Matrix(1.5, 1.5), alpha=False)
+        pil_img_api = enhance_board_image(Image.frombytes("RGB", [pix_api.width, pix_api.height], pix_api.samples))
         buf = io.BytesIO()
-        opt_img.save(buf, format="JPEG", quality=85)
+        pil_img_api.save(buf, format="JPEG", quality=80)
         api_image_parts.append(f"【第 {page_num} 頁板書圖片】：")
         api_image_parts.append(types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"))
 
@@ -239,7 +243,7 @@ def call_gemini_with_retry(contents, config):
             timeout=180_000,
             retry_options=types.HttpRetryOptions(
                 attempts=attempts,
-                initial_delay=15,
+                initial_delay=20,
                 max_delay=60,
                 exp_base=2,
                 jitter=3,
@@ -253,7 +257,6 @@ def call_gemini_with_retry(contents, config):
                 config=config,
             )
 
-    # 控制重試次數避免自己觸發 429 頻率限制
     fallback_chain = [
         ("gemini-3.8-flash", 2),
         ("gemini-3.5-flash-lite", 2),
@@ -263,7 +266,8 @@ def call_gemini_with_retry(contents, config):
     for idx, (model_name, attempts) in enumerate(fallback_chain):
         try:
             if idx > 0:
-                print(f"🔄 切換備援模型嘗試：{model_name}...")
+                print(f"⏳ 冷卻 20 秒後切換備援模型嘗試：{model_name}...")
+                time.sleep(20)
             return generate(model_name, attempts=attempts)
         except errors.APIError as error:
             last_error = error
@@ -275,7 +279,6 @@ def call_gemini_with_retry(contents, config):
 
 
 def is_pdf_already_processed(pdf_path: str, output_dir: str) -> bool:
-    """檢查該 PDF 是否已經在對應科目資料夾中生成過筆記"""
     if not os.path.exists(output_dir):
         return False
     existing_mds = glob.glob(f"{output_dir}/*.md")
@@ -323,7 +326,7 @@ def process_single_pdf(target_pdf: str):
 
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
-        max_output_tokens=12288,
+        max_output_tokens=8192,
         temperature=0.2,
     )
 
