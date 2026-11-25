@@ -7,9 +7,8 @@ on:
       - '原始檔案/**.pdf'
       - 'incoming/**.pdf'
 
-# 防止同時上傳多個檔案或與 issue_reply 互搶 git push 造成衝突
 concurrency:
-  group: note-generation-${{ github.ref }}
+  group: note-generation-refs/heads/main
   cancel-in-progress: false
 
 jobs:
@@ -46,6 +45,6 @@ jobs:
           git add notes/
           if ! git diff --quiet || ! git diff --staged --quiet; then
             git commit -m "docs: 自動生成課堂筆記 [skip ci]"
-            git pull --rebase
-            git push
+            git pull --rebase -X theirs origin main
+            git push origin main
           fi
