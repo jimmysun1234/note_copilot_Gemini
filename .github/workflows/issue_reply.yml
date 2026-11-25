@@ -48,6 +48,6 @@ jobs:
           git add notes/
           if ! git diff --quiet || ! git diff --staged --quiet; then
             git commit -m "docs: 根據 Issue 回覆更新課堂筆記 [skip ci]"
-            git pull --rebase origin main
+            git pull --rebase -X theirs origin main
             git push origin main
           fi
